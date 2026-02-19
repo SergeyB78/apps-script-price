@@ -15,7 +15,7 @@ const KP_EXPORT_CFG = {
   KP_SHEET: 'КП',
   LOG_SHEET: 'Журнал КП',
 
-  DRIVE_FOLDER_ID: '1o8lqVv3DlUe4e3bMpWKvNZncf5r_2xDD',
+  DRIVE_FOLDER_ID: CFG.IDS.DRIVE_FOLDER_ID,
 
   EXCLUDE_BLOCK_TITLES: {
     SETTINGS: 'Настройки расчёта',
