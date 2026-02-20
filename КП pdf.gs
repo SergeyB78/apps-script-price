@@ -12,10 +12,10 @@
  */
 
 const KP_EXPORT_CFG = {
-  KP_SHEET: (typeof CFG !== 'undefined' && CFG.SHEETS && CFG.SHEETS.KP) ? CFG.SHEETS.KP : 'КП',
-  LOG_SHEET: (typeof CFG !== 'undefined' && CFG.SHEETS && CFG.SHEETS.KP_LOG) ? CFG.SHEETS.KP_LOG : 'Журнал КП',
+  KP_SHEET: 'КП',
+  LOG_SHEET: 'Журнал КП',
 
-  DRIVE_FOLDER_ID: (typeof CFG !== 'undefined' && CFG.IDS && CFG.IDS.DRIVE_FOLDER_ID) ? CFG.IDS.DRIVE_FOLDER_ID : '1o8lqVv3DlUe4e3bMpWKvNZncf5r_2xDD',
+  DRIVE_FOLDER_ID: '1o8lqVv3DlUe4e3bMpWKvNZncf5r_2xDD',
 
   EXCLUDE_BLOCK_TITLES: {
     SETTINGS: 'Настройки расчёта',
@@ -28,6 +28,9 @@ const KP_EXPORT_CFG = {
 
   CART_HEADER: 'Артикул',
 
+
+  // Колонки корзины, которые НЕ должны попадать в PDF (временно скрываем перед экспортом)
+  CART_EXCLUDE_COL_TITLES: ['Скидка (-) / Наценка (+), %'],
   LOG_HEADERS: [
     'Дата/время выгрузки',
     'КП №',
@@ -76,6 +79,7 @@ function exportKpPdfAndLog() {
     return;
   }
 
+  const colsHidden = []; // [{col, wasHidden}] для временного скрытия колонок в PDF
   const toHide = [];
   try {
     // --- исключаем блок "Настройки расчёта"
@@ -99,6 +103,35 @@ function exportKpPdfAndLog() {
     const uniqueHide = Array.from(new Set(toHide)).filter(r => r >= 1 && r <= sh.getMaxRows());
     if (uniqueHide.length) hideRowsBySortedList_(sh, uniqueHide);
 
+    // --- исключаем из PDF колонки корзины (например, "Скидка %" для менеджеров)
+    try {
+      const cartHeaderRow = findCartHeaderRow_(sh, KP_EXPORT_CFG.CART_HEADER);
+      if (cartHeaderRow) {
+        const maxCol = sh.getLastColumn();
+        const headerValsRaw = sh.getRange(cartHeaderRow, 1, 1, maxCol).getDisplayValues()[0];
+        const headerVals = headerValsRaw.map(normalizeTitle_);
+        const titles = (KP_EXPORT_CFG.CART_EXCLUDE_COL_TITLES || []).map(normalizeTitle_).filter(Boolean);
+        for (const t of titles) {
+          // сначала точное совпадение, затем частичное (на случай переносов/разных пробелов)
+          let col = headerVals.findIndex(v => v === t) + 1;
+          if (col <= 0) col = headerVals.findIndex(v => v && v.indexOf(t) >= 0) + 1;
+          if (col <= 0 && t && t.indexOf('Скидка') === 0) col = headerVals.findIndex(v => v && v.indexOf('Скидка') === 0) + 1;
+
+          if (col > 0) {
+            const wasHidden = sh.isColumnHiddenByUser(col);
+            colsHidden.push({ col, wasHidden });
+            if (!wasHidden) sh.hideColumns(col);
+          }
+        }
+      }
+    } catch (e) {
+      // не блокируем экспорт, если не нашли корзину/колонку
+      Logger.log('PDF: не удалось скрыть колонку корзины: ' + e);
+    }
+
+
+        forceCartNameCenter_(sh);
+SpreadsheetApp.flush(); // применить скрытие строк/колонок перед экспортом PDF
     // meta + cart
     const meta = extractMetaForLog_(sh);
     const cart = extractCartAsJson_(sh);
@@ -120,7 +153,24 @@ function exportKpPdfAndLog() {
       const uniqueHide = Array.from(new Set(toHide)).filter(r => r >= 1 && r <= sh.getMaxRows());
       if (uniqueHide.length) showRowsBySortedList_(sh, uniqueHide);
     } catch (e) {}
+    // вернуть скрытые колонки
+    try {
+      if (colsHidden.length) {
+        // восстанавливаем только те, которые скрыли мы
+        for (const it of colsHidden) {
+          if (it && it.col && !it.wasHidden) {
+            sh.showColumns(it.col);
+          }
+        }
+      }
+    } catch (e) {}
   }
+}
+
+
+/** Normalize header/title for robust matching (handles line breaks, double spaces, etc.) */
+function normalizeTitle_(s) {
+  return String(s || '').replace(/\s+/g, ' ').trim();
 }
 
 /* ===================== VALIDATION ===================== */
@@ -331,6 +381,81 @@ function buildPdfFileName_(meta) {
 
 /* ===================== CART -> JSON ===================== */
 
+
+function findCartHeaderRow_(sh, cartHeaderText) {
+  const target = String(cartHeaderText || '').trim();
+  if (!target) return 0;
+  const maxScan = Math.min(300, sh.getLastRow());
+  for (let r = 1; r <= maxScan; r++) {
+    const v = String(sh.getRange(r, 1).getDisplayValue() || '').trim();
+    if (v === target) return r;
+  }
+  return 0;
+}
+
+
+
+/**
+ * FIX: иногда при экспорте в PDF у колонки "Наименование / размеры" слетает выравнивание.
+ * Перед экспортом принудительно ставим центр по горизонтали/вертикали для строк корзины.
+ */
+function forceCartNameCenter_(sh) {
+  const headerRow = findCartHeaderRow_(sh);
+  if (!headerRow) return;
+
+  // 1) определяем колонку "Наименование / размеры" (обычно D)
+  const lastCol = sh.getLastColumn();
+  const headerVals = sh.getRange(headerRow, 1, 1, lastCol).getDisplayValues()[0];
+
+  const norm = (s) => String(s || '')
+    .replace(/\u00A0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+
+  const target = norm('Наименование / размеры');
+  let idx = headerVals.findIndex(v => norm(v) === target);
+  if (idx < 0) idx = 3; // fallback: D
+  const col = idx + 1;
+
+  // 2) ищем строку начала итогового блока ("Итого за оборудование, руб") и считаем количество строк корзины
+  //    Это надёжнее, чем поклеточно проверять пустые строки (в PDF иногда "слетает" формат только у отдельных строк).
+  const maxScan = Math.min(300, sh.getLastRow());
+  let totalRow = 0;
+  for (let r = headerRow + 1; r <= maxScan; r++) {
+    const a = norm(sh.getRange(r, 1).getDisplayValue());
+    if (a.startsWith(norm('Итого за оборудование'))) { totalRow = r; break; }
+  }
+
+  let n = 0;
+  if (totalRow) {
+    n = Math.max(0, totalRow - (headerRow + 1));
+  } else {
+    // fallback: по двум колонкам A и col (bulk)
+    const lastRow = sh.getLastRow();
+    const maxRows = Math.min(200, lastRow - headerRow);
+    if (maxRows <= 0) return;
+
+    const artVals = sh.getRange(headerRow + 1, 1, maxRows, 1).getDisplayValues();
+    const nameVals = sh.getRange(headerRow + 1, col, maxRows, 1).getDisplayValues();
+
+    for (let i = 0; i < maxRows; i++) {
+      const art = String(artVals[i][0] || '').trim();
+      const name = String(nameVals[i][0] || '').trim();
+      if (!art && !name) break;
+      n++;
+    }
+  }
+
+  if (n <= 0) return;
+
+  // 3) принудительно применяем формат к диапазону строк корзины (именно ЗНАЧЕНИЯ, не заголовок)
+  sh.getRange(headerRow + 1, col, n, 1)
+    .setHorizontalAlignment('center')
+    .setVerticalAlignment('middle')
+    .setWrap(true);
+}
+
 function extractCartAsJson_(sh) {
   const maxScan = Math.min(300, sh.getLastRow());
   let headerRow = 0;
@@ -346,27 +471,34 @@ function extractCartAsJson_(sh) {
   const items = [];
 
   while (r <= last) {
-    const art = String(sh.getRange(r, 1).getDisplayValue() || '').trim();  // A
-    const name = String(sh.getRange(r, 4).getDisplayValue() || '').trim(); // D
+    const art = String(sh.getRange(r, 1).getDisplayValue() || '').trim();   // A Артикул
+    const name = String(sh.getRange(r, 4).getDisplayValue() || '').trim();  // D Наименование/размеры
 
     if (!art && !name) break;
     if (!art) { r++; continue; }
 
-    const unit = String(sh.getRange(r, 5).getDisplayValue() || '').trim(); // E
-    const price = toNumber_(sh.getRange(r, 6).getValue());     // F
-    const qty = toNumber_(sh.getRange(r, 7).getValue());       // G
-    const sumEquip = toNumber_(sh.getRange(r, 8).getValue());  // H
-    const installUnit = toNumber_(sh.getRange(r, 9).getValue());  // I
-    const sumInstall = toNumber_(sh.getRange(r, 10).getValue());  // J
-    const total = toNumber_(sh.getRange(r, 11).getValue());       // K
+    const unit = String(sh.getRange(r, 5).getDisplayValue() || '').trim();  // E Ед.
+    const price = toNumber_(sh.getRange(r, 6).getValue());                  // F Стоимость оборудования (за 1)
+    const qty = toNumber_(sh.getRange(r, 7).getValue());                    // G Кол-во
+    const sumEquip = toNumber_(sh.getRange(r, 8).getValue());               // H Всего за оборудование
+    const installUnit = toNumber_(sh.getRange(r, 9).getValue());            // I Стоимость монтажа
+    const sumInstall = toNumber_(sh.getRange(r, 10).getValue());            // J Всего за монтаж
+    const total = toNumber_(sh.getRange(r, 11).getValue());                 // K Итого
 
-    items.push({ art, name, unit, qty, price, sumEquip, installUnit, sumInstall, total });
+    // НОВОЕ: ручные поля менеджера из корзины
+    const note = String(sh.getRange(r, 12).getDisplayValue() || '').trim(); // L Примечание
+    const discountPct = toNumber_(sh.getRange(r, 13).getValue());           // M Скидка(-)/Наценка(+), %
+
+    items.push({
+      art, name, unit, qty, price, sumEquip, installUnit, sumInstall, total,
+      note, discountPct
+    });
+
     r++;
   }
 
   return { items, jsonString: JSON.stringify(items) };
 }
-
 /* ===================== HIDE/SHOW ROWS HELPERS ===================== */
 
 function hideRowsBySortedList_(sh, rows) {
