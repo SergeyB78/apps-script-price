@@ -48,13 +48,14 @@ const CFG = Object.freeze({
     HEADER_FILE_ID: 'HEADER_FILE_ID',
   }),
 
-  /** Настройки КП (задел на следующие коммиты) */
+  /** Настройки КП (используются в КП.gs) */
   KP: Object.freeze({
     COL_END: 11, // K
     DEFAULT_COL_WIDTH: 100,
     DEFAULT_ROW_HEIGHT: 21,
     FONT_SIZE: 20,
 
+    // ВНИМАНИЕ: позже лучше заменить на NamedRanges, чтобы строки не "плыли".
     PARAM_ROWS: Object.freeze({
       DISCOUNT: 19, // D19
       INSTALL: 20,  // D20

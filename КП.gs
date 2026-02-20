@@ -18,7 +18,7 @@ const KP_CFG = {
   SHEET_KP: 'КП',
   SHEET_PRICE: 'Прайс',
 
-  HEADER_FILE_ID: CFG.IDS.HEADER_FILE_ID,
+  HEADER_FILE_ID: '1E-6KvJH6CPFkEHgG0nLX_NE7rYlm67bw',
 
   COL_END: 11, // K
 

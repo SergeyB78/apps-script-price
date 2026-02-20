@@ -1,41 +1,60 @@
-const PRICE = {
-  SOURCE_SHEET: "БД Оборудования",
-  PRICE_SHEET: "Прайс",
-  ACTIVE_STATUS: "Активная позиция",
+/**
+ * Price.gs — формирование листа "Прайс" из "БД Оборудования"
+ * Поведение сохранено как в исходной версии:
+ * - пересоздаём лист "Прайс" (удаляем и создаём заново)
+ * - перемещаем "Прайс" на 2-е место
+ * - группирующие строки "Тип / Серия" в колонке B, merge B:I
+ * - outline (+/-) и сворачиваем группы
+ * - UID скрываем
+ * - копируем ширины колонок и форматы из БД
+ *
+ * onOpen() находится в main.gs (НЕ трогаем).
+ */
 
-  COL_UID: "UID",
-  COL_TYPE: "Вид оборудования",
-  COL_SERIES: "Серия",
-  COL_ART: "Артикул",
-  COL_VIEW1: "Вид 1",
-  COL_VIEW2: "Вид 2",
-  COL_NAME: "Наименование изделия/ размеры",
-  COL_UNIT: "Ед. изм.",
-  COL_PRICE: "Стоимость оборудования",
-  COL_NOTE: "Примечание",
-  COL_STATUS: "Статус позиции",
+const PRICE = {
+  SOURCE_SHEET: () => CFG.SHEETS.DB,
+  PRICE_SHEET: () => CFG.SHEETS.PRICE,
+  ACTIVE_STATUS: () => CFG.DB_VALUES.ACTIVE_STATUS,
+
+  COL_UID: () => CFG.DB_HEADERS.UID,
+  COL_TYPE: () => CFG.DB_HEADERS.EQUIP_TYPE,
+  COL_SERIES: () => CFG.DB_HEADERS.SERIES,
+  COL_ART: () => CFG.DB_HEADERS.SKU,
+  COL_VIEW1: () => CFG.DB_HEADERS.IMG1,
+  COL_VIEW2: () => CFG.DB_HEADERS.IMG2,
+  COL_NAME: () => CFG.DB_HEADERS.NAME,
+  COL_UNIT: () => CFG.DB_HEADERS.UNIT,
+  COL_PRICE: () => CFG.DB_HEADERS.COST,
+  COL_NOTE: () => CFG.DB_HEADERS.NOTE,
+  COL_STATUS: () => CFG.DB_HEADERS.STATUS,
 
   ICON: "🖼️",
 };
-
 
 /**
  * ВАЖНО: оставляем это имя, потому что у вас оно где-то уже используется
  * (меню/кнопка/назначенный скрипт).
  */
 function buildPriceSheetWithOutlines() {
-  buildPrice_();
+  const lock = LockService.getDocumentLock();
+  if (!lock.tryLock(30000)) return;
+
+  try {
+    buildPrice_();
+  } finally {
+    try { lock.releaseLock(); } catch (e) {}
+  }
 }
 
 /** алиас на всякий случай */
 function buildPrice() {
-  buildPrice_();
+  buildPriceSheetWithOutlines();
 }
 
 function buildPrice_() {
   const ss = SpreadsheetApp.getActive();
-  const src = ss.getSheetByName(PRICE.SOURCE_SHEET);
-  if (!src) throw new Error();
+  const src = ss.getSheetByName(PRICE.SOURCE_SHEET());
+  if (!src) throw new Error(`Не найден лист "${PRICE.SOURCE_SHEET()}".`);
 
   const values = src.getDataRange().getValues();
   if (values.length < 2) return;
@@ -44,41 +63,45 @@ function buildPrice_() {
   const idx = makeIndex_(header);
 
   const required = [
-    PRICE.COL_UID, PRICE.COL_TYPE, PRICE.COL_SERIES, PRICE.COL_ART,
-    PRICE.COL_VIEW1, PRICE.COL_VIEW2, PRICE.COL_NAME, PRICE.COL_UNIT,
-    PRICE.COL_PRICE, PRICE.COL_NOTE, PRICE.COL_STATUS
+    PRICE.COL_UID(), PRICE.COL_TYPE(), PRICE.COL_SERIES(), PRICE.COL_ART(),
+    PRICE.COL_VIEW1(), PRICE.COL_VIEW2(), PRICE.COL_NAME(), PRICE.COL_UNIT(),
+    PRICE.COL_PRICE(), PRICE.COL_NOTE(), PRICE.COL_STATUS()
   ];
-  for (const c of required) if (idx[c] === undefined) throw new Error();
+  for (const c of required) {
+    if (idx[c] === undefined) {
+      throw new Error(`На листе "${PRICE.SOURCE_SHEET()}" не найдена обязательная колонка: "${c}".`);
+    }
+  }
 
   const lastRow = src.getLastRow();
-  const view1RT = src.getRange(2, idx[PRICE.COL_VIEW1] + 1, lastRow - 1, 1).getRichTextValues();
-  const view2RT = src.getRange(2, idx[PRICE.COL_VIEW2] + 1, lastRow - 1, 1).getRichTextValues();
+  const view1RT = src.getRange(2, idx[PRICE.COL_VIEW1()] + 1, lastRow - 1, 1).getRichTextValues();
+  const view2RT = src.getRange(2, idx[PRICE.COL_VIEW2()] + 1, lastRow - 1, 1).getRichTextValues();
 
   const items = [];
   for (let r = 1; r < values.length; r++) {
     const row = values[r];
-    const status = String(row[idx[PRICE.COL_STATUS]] || "").trim();
-    if (status !== PRICE.ACTIVE_STATUS) continue;
+    const status = String(row[idx[PRICE.COL_STATUS()]] || "").trim();
+    if (status !== PRICE.ACTIVE_STATUS()) continue;
 
-    const uid = String(row[idx[PRICE.COL_UID]] || "").trim();
+    const uid = String(row[idx[PRICE.COL_UID()]] || "").trim();
     if (!uid) continue;
 
-    const type = String(row[idx[PRICE.COL_TYPE]] || "").trim();
-    const series = String(row[idx[PRICE.COL_SERIES]] || "").trim();
+    const type = String(row[idx[PRICE.COL_TYPE()]] || "").trim();
+    const series = String(row[idx[PRICE.COL_SERIES()]] || "").trim();
     const hasSeries = series ? 1 : 0;
 
-    const v1Url = extractUrl_(view1RT[r - 1]?.[0], row[idx[PRICE.COL_VIEW1]]);
-    const v2Url = extractUrl_(view2RT[r - 1]?.[0], row[idx[PRICE.COL_VIEW2]]);
+    const v1Url = extractUrl_(view1RT[r - 1]?.[0], row[idx[PRICE.COL_VIEW1()]]);
+    const v2Url = extractUrl_(view2RT[r - 1]?.[0], row[idx[PRICE.COL_VIEW2()]]);
 
     items.push({
       uid, type, series, hasSeries,
-      art: String(row[idx[PRICE.COL_ART]] || "").trim(),
+      art: String(row[idx[PRICE.COL_ART()]] || "").trim(),
       view1Url: v1Url,
       view2Url: v2Url,
-      name: row[idx[PRICE.COL_NAME]] || "",
-      unit: row[idx[PRICE.COL_UNIT]] || "",
-      price: row[idx[PRICE.COL_PRICE]] || "",
-      note: row[idx[PRICE.COL_NOTE]] || ""
+      name: row[idx[PRICE.COL_NAME()]] || "",
+      unit: row[idx[PRICE.COL_UNIT()]] || "",
+      price: row[idx[PRICE.COL_PRICE()]] || "",
+      note: row[idx[PRICE.COL_NOTE()]] || ""
     });
   }
 
@@ -92,13 +115,13 @@ function buildPrice_() {
   });
 
   // пересоздаём лист "Прайс"
-  let sh = ss.getSheetByName(PRICE.PRICE_SHEET);
+  let sh = ss.getSheetByName(PRICE.PRICE_SHEET());
   if (!sh) {
-    sh = ss.insertSheet(PRICE.PRICE_SHEET);
+    sh = ss.insertSheet(PRICE.PRICE_SHEET());
   } else {
     const oldIdx = sh.getIndex();
     ss.deleteSheet(sh);
-    sh = ss.insertSheet(PRICE.PRICE_SHEET, Math.max(0, oldIdx - 1));
+    sh = ss.insertSheet(PRICE.PRICE_SHEET(), Math.max(0, oldIdx - 1));
   }
 
   // делаем "Прайс" 2-м листом и активируем
@@ -146,21 +169,21 @@ function buildPrice_() {
 
   // Маппинг БД -> Прайс (форматы + ширины)
   const mapCols = [
-    { srcCol: idx[PRICE.COL_UID] + 1,   dstCol: 1 }, // UID
-    { srcCol: idx[PRICE.COL_ART] + 1,   dstCol: 2 }, // Артикул
-    { srcCol: idx[PRICE.COL_VIEW1] + 1, dstCol: 3 }, // Вид 1
-    { srcCol: idx[PRICE.COL_VIEW2] + 1, dstCol: 4 }, // Вид 2
-    { srcCol: idx[PRICE.COL_NAME] + 1,  dstCol: 5 }, // Наименование
-    { srcCol: idx[PRICE.COL_UNIT] + 1,  dstCol: 6 }, // Ед.
-    { srcCol: idx[PRICE.COL_PRICE] + 1, dstCol: 7 }, // Стоимость
-    { srcCol: idx[PRICE.COL_NOTE] + 1,  dstCol: 8 }, // Примечание
+    { srcCol: idx[PRICE.COL_UID()] + 1,   dstCol: 1 }, // UID
+    { srcCol: idx[PRICE.COL_ART()] + 1,   dstCol: 2 }, // Артикул
+    { srcCol: idx[PRICE.COL_VIEW1()] + 1, dstCol: 3 }, // Вид 1
+    { srcCol: idx[PRICE.COL_VIEW2()] + 1, dstCol: 4 }, // Вид 2
+    { srcCol: idx[PRICE.COL_NAME()] + 1,  dstCol: 5 }, // Наименование
+    { srcCol: idx[PRICE.COL_UNIT()] + 1,  dstCol: 6 }, // Ед.
+    { srcCol: idx[PRICE.COL_PRICE()] + 1, dstCol: 7 }, // Стоимость
+    { srcCol: idx[PRICE.COL_NOTE()] + 1,  dstCol: 8 }, // Примечание
   ];
 
   // ширины
   for (const m of mapCols) {
     sh.setColumnWidth(m.dstCol, src.getColumnWidth(m.srcCol));
   }
-  sh.setColumnWidth(9, src.getColumnWidth(idx[PRICE.COL_UNIT] + 1)); // Кол-во
+  sh.setColumnWidth(9, src.getColumnWidth(idx[PRICE.COL_UNIT()] + 1)); // Кол-во
 
   // форматы (шапка + строка 2 как шаблон)
   const dataRows = out.length;
@@ -172,7 +195,7 @@ function buildPrice_() {
         false
       );
     }
-    src.getRange(1, idx[PRICE.COL_NOTE] + 1, 1, 1).copyTo(
+    src.getRange(1, idx[PRICE.COL_NOTE()] + 1, 1, 1).copyTo(
       sh.getRange(1, 9, 1, 1),
       SpreadsheetApp.CopyPasteType.PASTE_FORMAT,
       false
@@ -264,6 +287,7 @@ function extractUrl_(rich, fallbackCellValue) {
     if (rich) {
       const u = rich.getLinkUrl && rich.getLinkUrl();
       if (u) return u;
+
       const runs = rich.getRuns && rich.getRuns();
       if (runs && runs.length) {
         for (const run of runs) {
@@ -273,6 +297,7 @@ function extractUrl_(rich, fallbackCellValue) {
       }
     }
   } catch (e) {}
+
   const s = String(fallbackCellValue || "").trim();
   const m = s.match(/https?:\/\/[^\s")]+/i);
   return m ? m[0] : "";
