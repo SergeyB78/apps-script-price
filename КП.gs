@@ -18,7 +18,7 @@ const KP_CFG = {
   SHEET_KP: 'КП',
   SHEET_PRICE: 'Прайс',
 
-  HEADER_FILE_ID: '1E-6KvJH6CPFkEHgG0nLX_NE7rYlm67bw',
+  HEADER_FILE_ID: (typeof CFG !== 'undefined' && CFG.IDS && CFG.IDS.HEADER_FILE_ID) ? CFG.IDS.HEADER_FILE_ID : '1E-6KvJH6CPFkEHgG0nLX_NE7rYlm67bw',
 
   COL_END: 11, // K
 
@@ -48,6 +48,33 @@ const KP_CFG = {
     QTY: 'Кол-во'
   }
 };
+
+/** Получить дефолтные значения КП из CFG.KP_DEFAULTS (с безопасными fallback) */
+function getKpDefaults_() {
+  const d = (typeof CFG !== 'undefined' && CFG.KP_DEFAULTS) ? CFG.KP_DEFAULTS : {};
+  const num = (v, fb) => {
+    if (v === null || v === undefined || v === '') return fb;
+    const n = Number(String(v).replace(',', '.'));
+    return (isFinite(n) ? n : fb);
+  };
+  const str = (v, fb) => {
+    if (v === null || v === undefined) return fb;
+    const s = String(v).trim();
+    return s ? s : fb;
+  };
+  return {
+    discountPct: num(d.DISCOUNT_PCT, 0),
+    installPct:  num(d.INSTALL_PCT, 25),
+    deliveryRub: num(d.DELIVERY_RUB, 0),
+
+    prepayShare: num(d.PREPAY_SHARE, 0.7),
+    leadMain:    str(d.LEAD_TIME_MAIN, '35-40 рабочих дней'),
+    leadEco:     str(d.LEAD_TIME_ECO, '40-45 рабочих дней'),
+    validDays:   num(d.VALID_DAYS, 7),
+  };
+}
+
+
 
 function buildKP() {
   const lock = LockService.getDocumentLock();
@@ -282,6 +309,7 @@ function buildParamsBlock_(sh, startRow) {
     .setWrap(true);
 
   // 4) Настройки расчёта (3 строки) — 19..21
+  const defs = getKpDefaults_();
   const settingsLabels = [
     'Скидка (-) / Наценка (+), %',
     'Размер монтажа от стоимости оборудования, %',
@@ -308,17 +336,17 @@ function buildParamsBlock_(sh, startRow) {
 
     if (settingsLabels[i] === 'Скидка (-) / Наценка (+), %') {
       input.setNumberFormat(KP_CFG.NUM_FMT_PCT);
-      sh.getRange(r, 4).setValue(0);
+      sh.getRange(r, 4).setValue(defs.discountPct);
     }
 
     if (settingsLabels[i] === 'Размер монтажа от стоимости оборудования, %') {
       input.setNumberFormat(KP_CFG.NUM_FMT_PCT);
-      sh.getRange(r, 4).setValue(25);
+      sh.getRange(r, 4).setValue(defs.installPct);
     }
 
     if (settingsLabels[i] === 'Доставка, руб') {
       input.setNumberFormat(KP_CFG.NUM_FMT_MONEY);
-      sh.getRange(r, 4).setValue(0);
+      sh.getRange(r, 4).setValue(defs.discountPct);
     }
   }
 
@@ -334,6 +362,7 @@ function buildParamsBlock_(sh, startRow) {
 /* ------------------- УСЛОВИЯ / СРОКИ (верхний блок) ------------------- */
 
 function buildTermsBlock_(sh, startRow) {
+  const defs = getKpDefaults_();
   sh.getRange(startRow, 1, 1, KP_CFG.COL_END)
     .merge()
     .setValue('Условия и сроки поставки (изменяемые)')
@@ -352,19 +381,19 @@ function buildTermsBlock_(sh, startRow) {
 
   // храним 0.7 (70%), отображаем как 70%
   const prepayCell = sh.getRange(rPrepay, 10, 1, 2).merge();
-  prepayCell.setValue(0.7)
+  prepayCell.setValue(defs.prepayShare)
     .setNumberFormat('0%')
     .setHorizontalAlignment('right')
     .setVerticalAlignment('middle');
 
   sh.getRange(rMain, 1, 1, 9).merge().setValue('Срок поставки Основное производство исчисляется с момента поступления предоплаты на р/счет и составляет:').setWrap(true).setVerticalAlignment('middle');
-  sh.getRange(rMain, 10, 1, 2).merge().setValue('35-40 рабочих дней').setHorizontalAlignment('right').setVerticalAlignment('middle').setWrap(true);
+  sh.getRange(rMain, 10, 1, 2).merge().setValue(defs.leadMain).setHorizontalAlignment('right').setVerticalAlignment('middle').setWrap(true);
 
   sh.getRange(rEco, 1, 1, 9).merge().setValue('Срок поставки ЭКО-серия исчисляется с момента поступления предоплаты на р/счет и составляет:').setWrap(true).setVerticalAlignment('middle');
-  sh.getRange(rEco, 10, 1, 2).merge().setValue('40-45 рабочих дней').setHorizontalAlignment('right').setVerticalAlignment('middle').setWrap(true);
+  sh.getRange(rEco, 10, 1, 2).merge().setValue(defs.leadEco).setHorizontalAlignment('right').setVerticalAlignment('middle').setWrap(true);
 
   sh.getRange(rValid, 1, 1, 9).merge().setValue('Данное КП действительно в течение:').setWrap(true).setVerticalAlignment('middle');
-  sh.getRange(rValid, 10, 1, 2).merge().setValue(7).setNumberFormat('0').setHorizontalAlignment('right').setVerticalAlignment('middle');
+  sh.getRange(rValid, 10, 1, 2).merge().setValue(defs.validDays).setNumberFormat('0').setHorizontalAlignment('right').setVerticalAlignment('middle');
 
   const afterRow = rValid + 1;
 

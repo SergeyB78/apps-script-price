@@ -1,88 +1,112 @@
 /**
- * settings.gs — единая конфигурация проекта.
+ * settings.gs — единые настройки проекта.
+ * Меняйте значения здесь, чтобы не искать их по разным файлам.
  *
- * Принцип:
- * 1) Все "магические" строки/имена/параметры — сюда.
- * 2) В рабочем коде постепенно заменяем литералы на CFG.*.
- * 3) Пока что ID (Drive) храним в коде. Позже перенесём в Script Properties.
+ * Примечание:
+ * - CFG хранится в глобальной области (одна на весь проект).
+ * - Если в будущем появятся другие настройки, добавляйте их в CFG.*.
  */
+var CFG = CFG || {};
 
-const CFG = Object.freeze({
-  /** Имена листов */
-  SHEETS: Object.freeze({
-    DB: 'БД Оборудования',
-    PRICE: 'Прайс',
-    KP: 'КП',
-    KP_LOG: 'Журнал КП',
-  }),
+// --- Листы ---
+CFG.SHEETS = CFG.SHEETS || {
+  DB: 'БД Оборудования',
+  PRICE: 'Прайс',
+  KP: 'КП',
+  KP_LOG: 'Журнал КП',
+};
 
-  /** Заголовки (колонки) в БД */
-  DB_HEADERS: Object.freeze({
-    UID: 'UID',
-    EQUIP_TYPE: 'Вид оборудования',
-    SERIES: 'Серия',
-    SKU: 'Артикул',
-    IMG1: 'Вид 1',
-    IMG2: 'Вид 2',
+// --- ID (Google Drive) ---
+CFG.IDS = CFG.IDS || {
+  // файл шапки КП (картинка/док)
+  HEADER_FILE_ID: '1E-6KvJH6CPFkEHgG0nLX_NE7rYlm67bw',
+  // папка, куда сохраняем PDF КП
+  DRIVE_FOLDER_ID: '1o8lqVv3DlUe4e3bMpWKvNZncf5r_2xDD',
+};
+
+// --- Настройки формирования КП (КП.gs) ---
+CFG.KP = CFG.KP || {
+  COL_END: 11, // K
+
+  DEFAULT_COL_WIDTH: 100,
+  DEFAULT_ROW_HEIGHT: 21,
+
+  FONT_SIZE: 20,
+
+  // 3-разрядная группировка
+  NUM_FMT_MONEY: '#,##0.00',
+  NUM_FMT_INT: '#,##0',
+  NUM_FMT_PCT: '0.00',
+  NUM_FMT_TEXT: '@',
+
+  // строки параметров (после вставки пустой строки между блоками)
+  PARAM_ROW_DISCOUNT: 19,        // D19  Скидка(-)/Наценка(+)
+  PARAM_ROW_INSTALL_PCT: 20,     // D20  Монтаж, %
+  PARAM_ROW_DELIVERY: 21,        // D21  Доставка, руб
+
+  PRICE_HEADERS: {
+    ART: 'Артикул',
+    VIEW1: 'Вид 1',
+    VIEW2: 'Вид 2',
     NAME: 'Наименование изделия/ размеры',
     UNIT: 'Ед. изм.',
     COST: 'Стоимость оборудования',
-    STATUS: 'Статус позиции',
-    NOTE: 'Примечание',
-  }),
+    QTY: 'Кол-во'
+  },
+};
 
-  /** Значения, которые встречаются в БД */
-  DB_VALUES: Object.freeze({
-    ACTIVE_STATUS: 'Активная позиция',
-  }),
+// --- Настройки экспорта КП в PDF (КП pdf.gs) ---
+CFG.KP_PDF = 
+// --- Дефолтные значения, которые могут меняться (КП.gs) ---
+// ВАЖНО: это значения по умолчанию при формировании КП. Если пользователь поменял их вручную в КП,
+// а потом снова нажал buildKP(), они будут установлены заново.
+CFG.KP_DEFAULTS = CFG.KP_DEFAULTS || {
+  DISCOUNT_PCT: 0,                 // Скидка (-) / Наценка (+), %
+  INSTALL_PCT: 25,                 // Размер монтажа от стоимости оборудования, %
+  DELIVERY_RUB: 0,                 // Доставка, руб
 
-  /** ID (Пока в коде. Потом лучше перенесём в Script Properties.) */
-  IDS: Object.freeze({
-    HEADER_FILE_ID: '1E-6KvJH6CPFkEHgG0nLX_NE7rYlm67bw',
-    DRIVE_FOLDER_ID: '1o8lqVv3DlUe4e3bMpWKvNZncf5r_2xDD',
-  }),
+  PREPAY_SHARE: 0.7,               // Предоплата (доля): 0.7 = 70%
+  LEAD_TIME_MAIN: '35-40 рабочих дней',
+  LEAD_TIME_ECO: '40-45 рабочих дней',
+  VALID_DAYS: 7                    // КП действительно, дней
+};
 
-  /** Ключи Script Properties (на будущее, когда уберём ID из GitHub) */
-  PROPS: Object.freeze({
-    DRIVE_FOLDER_ID: 'DRIVE_FOLDER_ID',
-    HEADER_FILE_ID: 'HEADER_FILE_ID',
-  }),
+CFG.KP_PDF || {
+  EXCLUDE_BLOCK_TITLES: {
+    SETTINGS: 'Настройки расчёта',
+    TERMS: 'Условия и сроки поставки (изменяемые)'
+  },
 
-  /** Настройки КП (используются в КП.gs) */
-  KP: Object.freeze({
-    COL_END: 11, // K
-    DEFAULT_COL_WIDTH: 100,
-    DEFAULT_ROW_HEIGHT: 21,
-    FONT_SIZE: 20,
+  // сколько строк скрывать ПОСЛЕ заголовка (не включая строку заголовка)
+  SETTINGS_ROWS_AFTER_TITLE: 3, // Скидка/Монтаж%/Доставка
+  TERMS_ROWS_AFTER_TITLE: 4,    // 4 строки условий
 
-    // ВНИМАНИЕ: позже лучше заменить на NamedRanges, чтобы строки не "плыли".
-    PARAM_ROWS: Object.freeze({
-      DISCOUNT: 19, // D19
-      INSTALL: 20,  // D20
-      DELIVERY: 21, // D21
-    }),
+  CART_HEADER: 'Артикул',
 
-    NUMBER_FORMATS: Object.freeze({
-      MONEY: '#,##0.00',
-      INT: '#,##0',
-      PCT: '0.00',
-      TEXT: '@',
-    }),
-  }),
-});
-
-/**
- * Заготовка на будущее:
- * Получить Script Property.
- * required=true -> кидает понятную ошибку, если свойства нет.
- */
-function getScriptProp_(key, required = true) {
-  const v = PropertiesService.getScriptProperties().getProperty(key);
-  if ((v === null || v === undefined || String(v).trim() === '') && required) {
-    throw new Error(
-      `Не задан Script Property: "${key}". ` +
-      `Задай в Apps Script → Project Settings → Script properties.`
-    );
-  }
-  return v;
-}
+  LOG_HEADERS: [
+  "Дата/время выгрузки",
+  "КП №",
+  "Дата КП",
+  "Менеджер",
+  "Телефон",
+  "Заказчик",
+  "Адрес заказчика",
+  "№ договора",
+  "Скидка (-) / Наценка (+), %",
+  "Размер монтажа от стоимости оборудования, %",
+  "Итого оборудование, руб",
+  "Монтаж, руб",
+  "Доставка, руб",
+  "Итого к оплате, руб",
+  "НДС 22%, руб",
+  "Предоплата, %",
+  "Сумма предоплаты, руб",
+  "Срок (Основное)",
+  "Срок (ЭКО)",
+  "КП действительно, дней",
+  "Позиции (JSON)",
+  "PDF URL (Drive)",
+  "PDF Download URL",
+  "Drive File ID"
+]
+};

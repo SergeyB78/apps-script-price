@@ -12,10 +12,10 @@
  */
 
 const KP_EXPORT_CFG = {
-  KP_SHEET: 'КП',
-  LOG_SHEET: 'Журнал КП',
+  KP_SHEET: (typeof CFG !== 'undefined' && CFG.SHEETS && CFG.SHEETS.KP) ? CFG.SHEETS.KP : 'КП',
+  LOG_SHEET: (typeof CFG !== 'undefined' && CFG.SHEETS && CFG.SHEETS.KP_LOG) ? CFG.SHEETS.KP_LOG : 'Журнал КП',
 
-  DRIVE_FOLDER_ID: CFG.IDS.DRIVE_FOLDER_ID,
+  DRIVE_FOLDER_ID: (typeof CFG !== 'undefined' && CFG.IDS && CFG.IDS.DRIVE_FOLDER_ID) ? CFG.IDS.DRIVE_FOLDER_ID : '1o8lqVv3DlUe4e3bMpWKvNZncf5r_2xDD',
 
   EXCLUDE_BLOCK_TITLES: {
     SETTINGS: 'Настройки расчёта',
