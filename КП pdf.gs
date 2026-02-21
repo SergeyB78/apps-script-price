@@ -15,7 +15,7 @@ const KP_EXPORT_CFG = {
   KP_SHEET: 'КП',
   LOG_SHEET: 'Журнал КП',
 
-  DRIVE_FOLDER_ID: '1o8lqVv3DlUe4e3bMpWKvNZncf5r_2xDD',
+  DRIVE_FOLDER_ID: ((typeof CFG !== 'undefined' && CFG.IDS && CFG.IDS.DRIVE_FOLDER_ID) ? CFG.IDS.DRIVE_FOLDER_ID : '1o8lqVv3DlUe4e3bMpWKvNZncf5r_2xDD'),
 
   EXCLUDE_BLOCK_TITLES: {
     SETTINGS: 'Настройки расчёта',
@@ -61,6 +61,38 @@ const KP_EXPORT_CFG = {
     'Drive File ID'
   ]
 };
+
+// ===================== ЖУРНАЛ КП: какие колонки оставляем видимыми =====================
+// ВАЖНО: группировка делается ПО НАЗВАНИЯМ ЗАГОЛОВКОВ (не по цветам).
+// Если хотите изменить "важные" колонки — правьте список VISIBLE_HEADERS.
+const JOURNAL_LAYOUT = {
+  HEADER_ROW: 1,
+
+  // Эти колонки остаются открытыми (видимыми) — остальные будут свернуты группами
+  VISIBLE_HEADERS: [
+    'Дата/время выгрузки',
+    'КП №',
+    'Дата КП',
+    'Менеджер',
+    'Заказчик',
+    'Адрес заказчика',
+
+    'Итого оборудование, руб',
+    'Монтаж, руб',
+    'Доставка, руб',
+    'Итого к оплате, руб',
+    'Сумма предоплаты, руб',
+
+    'PDF URL (Drive)',
+    'Drive File ID'
+  ],
+
+  // Эти колонки скрываем всегда (не группируем)
+  ALWAYS_HIDE_HEADERS: [
+    'PDF Download URL'
+  ]
+};
+
 
 /**
  * Меню вызывает эту функцию.
@@ -108,15 +140,10 @@ function exportKpPdfAndLog() {
       const cartHeaderRow = findCartHeaderRow_(sh, KP_EXPORT_CFG.CART_HEADER);
       if (cartHeaderRow) {
         const maxCol = sh.getLastColumn();
-        const headerValsRaw = sh.getRange(cartHeaderRow, 1, 1, maxCol).getDisplayValues()[0];
-        const headerVals = headerValsRaw.map(normalizeTitle_);
-        const titles = (KP_EXPORT_CFG.CART_EXCLUDE_COL_TITLES || []).map(normalizeTitle_).filter(Boolean);
+        const headerVals = sh.getRange(cartHeaderRow, 1, 1, maxCol).getDisplayValues()[0].map(s => String(s || '').trim());
+        const titles = (KP_EXPORT_CFG.CART_EXCLUDE_COL_TITLES || []).map(t => String(t || '').trim()).filter(Boolean);
         for (const t of titles) {
-          // сначала точное совпадение, затем частичное (на случай переносов/разных пробелов)
-          let col = headerVals.findIndex(v => v === t) + 1;
-          if (col <= 0) col = headerVals.findIndex(v => v && v.indexOf(t) >= 0) + 1;
-          if (col <= 0 && t && t.indexOf('Скидка') === 0) col = headerVals.findIndex(v => v && v.indexOf('Скидка') === 0) + 1;
-
+          const col = headerVals.findIndex(v => v === t) + 1;
           if (col > 0) {
             const wasHidden = sh.isColumnHiddenByUser(col);
             colsHidden.push({ col, wasHidden });
@@ -130,8 +157,7 @@ function exportKpPdfAndLog() {
     }
 
 
-        forceCartNameCenter_(sh);
-SpreadsheetApp.flush(); // применить скрытие строк/колонок перед экспортом PDF
+    SpreadsheetApp.flush(); // применить скрытие строк/колонок перед экспортом PDF
     // meta + cart
     const meta = extractMetaForLog_(sh);
     const cart = extractCartAsJson_(sh);
@@ -167,28 +193,34 @@ SpreadsheetApp.flush(); // применить скрытие строк/коло
   }
 }
 
-
-/** Normalize header/title for robust matching (handles line breaks, double spaces, etc.) */
-function normalizeTitle_(s) {
-  return String(s || '').replace(/\s+/g, ' ').trim();
-}
-
 /* ===================== VALIDATION ===================== */
 
 function validateRequiredKpFields_(sh) {
-  const requiredLabels = [
-    'Наименование Заказчика',
-    'Адрес Заказчика',
-    'Менеджер'
+  // Возвращает массив недостающих "человеческих" названий обязательных полей
+  const required = [
+    { title: 'КП №', labels: ['КП №', 'КП№', 'Коммерческое предложение №', 'Коммерческое предложение N', 'Коммерческое предложение №:'] },
+    { title: 'Дата КП', labels: ['Дата КП', 'Дата КП:'] },
+    { title: 'Менеджер', labels: ['Менеджер', 'Менеджер:'] },
+    { title: 'Заказчик', labels: ['Заказчик', 'Заказчик:', 'Наименование Заказчика', 'Наименование заказчика'] },
+    { title: 'Адрес заказчика', labels: ['Адрес заказчика', 'Адрес Заказчика', 'Адрес заказчика:'] },
   ];
 
   const missing = [];
-  for (const label of requiredLabels) {
-    const v = findValueByLabelInColD_(sh, label); // значение из колонки D по подписи в A (A:C merged)
-    if (isEmptyValue_(v)) missing.push(label);
+
+  required.forEach((f) => {
+    const v = findValueByAnyLabelInColD_(sh, f.labels);
+    if (!String(v || '').trim()) missing.push(f.title);
+  });
+
+  // Корзина: должны быть позиции с кол-вом > 0
+  const cart = extractCartAsJson_(sh);
+  if (!cart.items || cart.items.length === 0) {
+    missing.push('Корзина: нет позиций (кол-во > 0)');
   }
+
   return missing;
 }
+
 
 function isEmptyValue_(v) {
   if (v === null || v === undefined) return true;
@@ -270,7 +302,15 @@ function appendToLog_(ss, rowValues) {
 
   // базовые форматы
   log.getRange(nextRow, 1).setNumberFormat('dd.mm.yyyy hh:mm:ss');
+
+  // Сворачиваем "белые" колонки (неважные), чтобы важные (зелёные) были видны без горизонтального скролла
+  try {
+    applyLogColumnGrouping_(log);
+  } catch (e) {
+    // не критично
+  }
 }
+
 
 /* ===================== META EXTRACTION ===================== */
 
@@ -394,111 +434,70 @@ function findCartHeaderRow_(sh, cartHeaderText) {
 }
 
 
-
-/**
- * FIX: иногда при экспорте в PDF у колонки "Наименование / размеры" слетает выравнивание.
- * Перед экспортом принудительно ставим центр по горизонтали/вертикали для строк корзины.
- */
-function forceCartNameCenter_(sh) {
-  const headerRow = findCartHeaderRow_(sh);
-  if (!headerRow) return;
-
-  // 1) определяем колонку "Наименование / размеры" (обычно D)
-  const lastCol = sh.getLastColumn();
-  const headerVals = sh.getRange(headerRow, 1, 1, lastCol).getDisplayValues()[0];
-
-  const norm = (s) => String(s || '')
-    .replace(/\u00A0/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .toLowerCase();
-
-  const target = norm('Наименование / размеры');
-  let idx = headerVals.findIndex(v => norm(v) === target);
-  if (idx < 0) idx = 3; // fallback: D
-  const col = idx + 1;
-
-  // 2) ищем строку начала итогового блока ("Итого за оборудование, руб") и считаем количество строк корзины
-  //    Это надёжнее, чем поклеточно проверять пустые строки (в PDF иногда "слетает" формат только у отдельных строк).
-  const maxScan = Math.min(300, sh.getLastRow());
-  let totalRow = 0;
-  for (let r = headerRow + 1; r <= maxScan; r++) {
-    const a = norm(sh.getRange(r, 1).getDisplayValue());
-    if (a.startsWith(norm('Итого за оборудование'))) { totalRow = r; break; }
-  }
-
-  let n = 0;
-  if (totalRow) {
-    n = Math.max(0, totalRow - (headerRow + 1));
-  } else {
-    // fallback: по двум колонкам A и col (bulk)
-    const lastRow = sh.getLastRow();
-    const maxRows = Math.min(200, lastRow - headerRow);
-    if (maxRows <= 0) return;
-
-    const artVals = sh.getRange(headerRow + 1, 1, maxRows, 1).getDisplayValues();
-    const nameVals = sh.getRange(headerRow + 1, col, maxRows, 1).getDisplayValues();
-
-    for (let i = 0; i < maxRows; i++) {
-      const art = String(artVals[i][0] || '').trim();
-      const name = String(nameVals[i][0] || '').trim();
-      if (!art && !name) break;
-      n++;
-    }
-  }
-
-  if (n <= 0) return;
-
-  // 3) принудительно применяем формат к диапазону строк корзины (именно ЗНАЧЕНИЯ, не заголовок)
-  sh.getRange(headerRow + 1, col, n, 1)
-    .setHorizontalAlignment('center')
-    .setVerticalAlignment('middle')
-    .setWrap(true);
-}
-
 function extractCartAsJson_(sh) {
-  const maxScan = Math.min(300, sh.getLastRow());
-  let headerRow = 0;
+  const CART_HEADER = KP_EXPORT_CFG.CART_HEADER; // "Артикул"
+  const lastRow = sh.getLastRow();
+  if (lastRow < 1) return { items: [], jsonString: '[]' };
 
+  // Ищем строку заголовков корзины по "Артикул" в колонке A
+  let headerRow = 0;
+  const maxScan = Math.min(lastRow, 250);
   for (let r = 1; r <= maxScan; r++) {
     const v = String(sh.getRange(r, 1).getDisplayValue() || '').trim();
-    if (v === KP_EXPORT_CFG.CART_HEADER) { headerRow = r; break; }
+    if (v === CART_HEADER) { headerRow = r; break; }
   }
   if (!headerRow) return { items: [], jsonString: '[]' };
 
-  let r = headerRow + 1;
-  const last = sh.getLastRow();
+  const startRow = headerRow + 1;
+  const numRows = Math.max(0, lastRow - startRow + 1);
+
+  // Ширина корзины: A..K базово + Примечание (L) + Скидка (M) = 13
+  // (если колонок меньше — Google вернёт только существующие значения)
+  const width = 13;
+
+  const rng = sh.getRange(startRow, 1, numRows, width);
+  const values = rng.getValues();
+
   const items = [];
+  for (let i = 0; i < values.length; i++) {
+    const row = values[i];
 
-  while (r <= last) {
-    const art = String(sh.getRange(r, 1).getDisplayValue() || '').trim();   // A Артикул
-    const name = String(sh.getRange(r, 4).getDisplayValue() || '').trim();  // D Наименование/размеры
+    const art = String(row[0] || '').trim(); // A
+    if (!art) continue;
 
-    if (!art && !name) break;
-    if (!art) { r++; continue; }
+    const qty = toNumber_(row[6]); // G: Кол-во
+    if (!qty || qty <= 0) continue;
 
-    const unit = String(sh.getRange(r, 5).getDisplayValue() || '').trim();  // E Ед.
-    const price = toNumber_(sh.getRange(r, 6).getValue());                  // F Стоимость оборудования (за 1)
-    const qty = toNumber_(sh.getRange(r, 7).getValue());                    // G Кол-во
-    const sumEquip = toNumber_(sh.getRange(r, 8).getValue());               // H Всего за оборудование
-    const installUnit = toNumber_(sh.getRange(r, 9).getValue());            // I Стоимость монтажа
-    const sumInstall = toNumber_(sh.getRange(r, 10).getValue());            // J Всего за монтаж
-    const total = toNumber_(sh.getRange(r, 11).getValue());                 // K Итого
+    const item = {
+      art,
+      // D: Наименование/размеры
+      name: String(row[3] || '').trim(),
+      // E: Ед.изм.
+      unit: String(row[4] || '').trim(),
+      qty,
+      // F: Стоимость оборудования
+      price: toNumber_(row[5]),
+      // H: Всего за оборудование
+      sumEquip: toNumber_(row[7]),
+      // I: Стоимость монтажа (за единицу)
+      installUnit: toNumber_(row[8]),
+      // J: Всего за монтаж
+      sumInstall: toNumber_(row[9]),
+      // K: Итого
+      total: toNumber_(row[10]),
+      // L: Примечание (ручное)
+      note: String(row[11] || '').trim(),
+      // M: Скидка(-)/Наценка(+), % (индивидуальная)
+      discountPct: toNumber_(row[12]),
+    };
 
-    // НОВОЕ: ручные поля менеджера из корзины
-    const note = String(sh.getRange(r, 12).getDisplayValue() || '').trim(); // L Примечание
-    const discountPct = toNumber_(sh.getRange(r, 13).getValue());           // M Скидка(-)/Наценка(+), %
-
-    items.push({
-      art, name, unit, qty, price, sumEquip, installUnit, sumInstall, total,
-      note, discountPct
-    });
-
-    r++;
+    items.push(item);
   }
 
   return { items, jsonString: JSON.stringify(items) };
 }
+
+
 /* ===================== HIDE/SHOW ROWS HELPERS ===================== */
 
 function hideRowsBySortedList_(sh, rows) {
@@ -577,6 +576,15 @@ function findValueByLabelInColD_(sh, label) {
 /**
  * В блоке условий: слева текст в A (A:I merged), справа значение в J (J:K merged)
  */
+function findValueByAnyLabelInColD_(sh, labels) {
+  for (let i = 0; i < labels.length; i++) {
+    const v = findValueByLabelInColD_(sh, labels[i]);
+    if (String(v || '').trim()) return v;
+  }
+  return '';
+}
+
+
 function findTermsValueRight_(sh, leftText) {
   const target = String(leftText || '').trim();
   if (!target) return '';
@@ -631,4 +639,90 @@ function showLinksDialog_(fileUrl, downloadUrl) {
   ).setWidth(420).setHeight(120);
 
   SpreadsheetApp.getUi().showModalDialog(html, 'КП → PDF');
+}
+
+/* ===================== JOURNAL COLUMN GROUPING ===================== */
+
+function applyLogColumnGrouping_(sh) {
+  const headerRow = JOURNAL_LAYOUT.HEADER_ROW || 1;
+  const lastCol = sh.getLastColumn();
+  if (lastCol < 2) return;
+
+  // 1) Сброс: показать все колонки и снять старые группы
+  try { sh.showColumns(1, sh.getMaxColumns()); } catch (e) {}
+  try {
+    // снимаем глубину группировки (если есть)
+    sh.getRange(headerRow, 1, 1, lastCol).shiftColumnGroupDepth(-10);
+  } catch (e) {}
+
+  // 2) Заголовки
+  const headers = sh.getRange(headerRow, 1, 1, lastCol).getDisplayValues()[0]
+    .map(h => normalizeHeader_(h));
+
+  const headerToCol = {};
+  for (let c = 0; c < headers.length; c++) {
+    if (headers[c]) headerToCol[headers[c]] = c + 1; // 1-based
+  }
+
+  // 3) Какие колонки видимы
+  const visibleCols = new Set();
+  (JOURNAL_LAYOUT.VISIBLE_HEADERS || []).forEach((h) => {
+    const col = headerToCol[normalizeHeader_(h)];
+    if (col) visibleCols.add(col);
+  });
+
+  // 4) Скрываем "всегда скрытые" колонки
+  (JOURNAL_LAYOUT.ALWAYS_HIDE_HEADERS || []).forEach((h) => {
+    const col = headerToCol[normalizeHeader_(h)];
+    if (col) {
+      try { sh.hideColumns(col); } catch (e) {}
+      visibleCols.delete(col);
+    }
+  });
+
+  // 5) Группируем и сворачиваем ВСЕ НЕ-видимые колонки блоками
+  let start = null;
+  for (let col = 1; col <= lastCol; col++) {
+    const isHidden = safeIsColumnHidden_(sh, col);
+    const isVisible = visibleCols.has(col);
+
+    const shouldGroup = !isVisible && !isHidden;
+
+    if (shouldGroup) {
+      if (start === null) start = col;
+    } else {
+      if (start !== null) {
+        collapseRange_(sh, start, col - 1, headerRow);
+        start = null;
+      }
+    }
+  }
+  if (start !== null) collapseRange_(sh, start, lastCol, headerRow);
+}
+
+
+
+function normalizeHeader_(v) {
+  return String(v || '')
+    .replace(/\s+/g, ' ')
+    .replace(/\u00A0/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function safeIsColumnHidden_(sh, col) {
+  try { return sh.isColumnHiddenByUser(col); } catch (e) { return false; }
+}
+
+function collapseRange_(sh, startCol, endCol, headerRow) {
+  if (!startCol || !endCol || endCol < startCol) return;
+  const width = endCol - startCol + 1;
+  try {
+    sh.getRange(headerRow || 1, startCol, 1, width).shiftColumnGroupDepth(1);
+    const g = sh.getColumnGroup(startCol, 1);
+    if (g) g.collapse();
+  } catch (e) {
+    // если группировка недоступна в этом аккаунте/документе — просто скрываем диапазон
+    try { sh.hideColumns(startCol, width); } catch (e2) {}
+  }
 }
