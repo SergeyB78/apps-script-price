@@ -1,16 +1,27 @@
 /**
- * КП.gs — buildKP (onOpen в main.gs НЕ трогаем)
+ * КП.gs — формирование КП
  *
- * ДОРАБОТКИ:
- * 1) UID-связка Прайс → КП:
- *    - UID переносим в скрытую колонку N (14) в корзине КП
- * 2) Исключаем строки-группы из корзины:
- *    - Берём в КП только строки, где (Кол-во > 0) И (UID не пустой)
- * 3) НОВОЕ ТРЕБОВАНИЕ:
- *    - Если в "Прайс" не выбрано ни одной позиции (qty>0 и UID есть),
- *      то КП НЕ формируем (не чистим лист КП), показываем предупреждение и выходим.
- * 4) FIX "Those columns are out of bounds":
- *    - Перед setColumnWidth гарантируем, что лист КП имеет минимум 14 колонок.
+ * Добавлено:
+ * 1) Диалог при запуске "Сформировать КП":
+ *    - ДА  : сформировать заново С ПОЛНОЙ ОЧИСТКОЙ листа "КП"
+ *    - НЕТ : обновить КП БЕЗ ПОЛНОЙ ОЧИСТКИ (сохранить ручные данные; обновить корзину/итоги)
+ *    - ОТМЕНА: ничего не делать
+ *
+ * 2) Проверка выбора в "Прайс":
+ *    - Если не выбрано ни одной позиции (qty>0 и UID заполнен) — КП не формируем
+ *
+ * 3) Исключаем строки-группы из корзины:
+ *    - В КП попадают только строки где (Кол-во > 0) И (UID не пустой)
+ *
+ * 4) UID в КП:
+ *    - UID переносим в скрытую колонку N (14) корзины КП
+ *
+ * 5) FIX "Those columns are out of bounds":
+ *    - Гарантируем, что на листе КП есть минимум 14 колонок.
+ *
+ * 6) FIX ошибки "#REF!" в D21 при выборе "НЕТ":
+ *    - При обновлении итогов ищем строки итогов ТОЛЬКО начиная с блока итогов (totalsStartRow),
+ *      чтобы не попасть в "Доставка, руб" в блоке "Настройки расчёта".
  */
 
 const KP_CFG = {
@@ -28,7 +39,6 @@ const KP_CFG = {
   DEFAULT_ROW_HEIGHT: 21,
   FONT_SIZE: 20,
 
-  // форматы
   NUM_FMT_MONEY: '#,##0.00',
   NUM_FMT_INT: '#,##0',
   NUM_FMT_PCT: '0.00',
@@ -39,7 +49,6 @@ const KP_CFG = {
   PARAM_ROW_INSTALL_PCT: 20,  // D20
   PARAM_ROW_DELIVERY: 21,     // D21
 
-  // заголовки "Прайс"
   PRICE_HEADERS: {
     UID: 'UID',
     ART: 'Артикул',
@@ -51,54 +60,440 @@ const KP_CFG = {
     QTY: 'Кол-во',
   },
 
-  // колонки КП корзины
   CART_COLS: {
     DISCOUNT_PCT: 13, // M
     UID: 14,          // N (скрытая)
   },
 };
 
-/** FIX: гарантируем размер листа (иначе setColumnWidth(14, ...) падает) */
-function ensureSheetSize_(sh, minRows, minCols) {
+/* ========================= ENTRY POINT (меню) ========================= */
+
+function buildKP() {
+  const ss = SpreadsheetApp.getActive();
+  const ui = SpreadsheetApp.getUi();
+
+  const shPrice = ss.getSheetByName(KP_CFG.SHEET_PRICE);
+  if (!shPrice) {
+    ui.alert('Ошибка', 'Не найден лист "Прайс".', ui.ButtonSet.OK);
+    return;
+  }
+
+  // 1) Сначала проверяем, что есть выбранные позиции (qty>0 и UID заполнен)
+  const selectedCount = kp_countSelectedPositionsInPrice_(shPrice);
+  if (selectedCount <= 0) {
+    ui.alert('КП не сформировано', 'В листе "Прайс" не выбрана ни одна позиция (Кол-во > 0).', ui.ButtonSet.OK);
+    ss.setActiveSheet(shPrice);
+    return;
+  }
+
+  // 2) Диалог выбора режима
+  const msg =
+    'Выберите режим формирования КП:\n\n' +
+    'ДА — сформировать заново с полной очисткой листа «КП» (все данные, введённые вручную, будут удалены).\n\n' +
+    'НЕТ — обновить КП без полной очистки (ручные данные сохранятся; корзина/итоги будут обновлены).\n\n' +
+    'ОТМЕНА — ничего не делать.';
+
+  const btn = ui.alert('Формирование КП', msg, ui.ButtonSet.YES_NO_CANCEL);
+
+  if (btn === ui.Button.CANCEL || btn === ui.Button.CLOSE) return;
+
+  if (btn === ui.Button.YES) {
+    kp_buildKP_reset_();
+  } else if (btn === ui.Button.NO) {
+    kp_buildKP_update_();
+  }
+}
+
+/* ========================= MODE: RESET (полная очистка) ========================= */
+
+function kp_buildKP_reset_() {
+  const lock = LockService.getDocumentLock();
+  if (!lock.tryLock(30000)) return;
+
+  try {
+    const ss = SpreadsheetApp.getActive();
+    const shPrice = ss.getSheetByName(KP_CFG.SHEET_PRICE);
+    if (!shPrice) throw new Error('Не найден лист "Прайс".');
+
+    // защита
+    const selectedCount = kp_countSelectedPositionsInPrice_(shPrice);
+    if (selectedCount <= 0) {
+      SpreadsheetApp.getUi().alert('КП не сформировано', 'В листе "Прайс" не выбрана ни одна позиция (Кол-во > 0).', SpreadsheetApp.getUi().ButtonSet.OK);
+      ss.setActiveSheet(shPrice);
+      return;
+    }
+
+    const shKP = ss.getSheetByName(KP_CFG.SHEET_KP) || ss.insertSheet(KP_CFG.SHEET_KP);
+    ss.setActiveSheet(shKP);
+
+    kp_ensureSheetSize_(shKP, 200, KP_CFG.COL_END);
+
+    kp_clearSheetHardAndResetSizes_(shKP);
+    kp_setupKpColumns_(shKP);
+
+    kp_insertHeaderImageOverCells_(shKP, KP_CFG.HEADER_FILE_ID, 1, 1, 7, KP_CFG.COL_PRINT_END);
+
+    let row = 9;
+    row = kp_buildParamsBlock_(shKP, row);
+
+    row += 1;
+    const termsInfo = kp_buildTermsBlock_(shKP, row);
+    row = termsInfo.afterRow;
+
+    row += 2;
+    const cartInfo = kp_buildCartBlockFromPrice_(shKP, shPrice, row);
+    row = cartInfo.afterRow;
+
+    row += 1;
+    const totalsInfo = kp_buildTotalsBlock_(shKP, row, cartInfo.firstDataRow, cartInfo.lastDataRow);
+    row = totalsInfo.afterRow;
+
+    row += 1;
+    kp_buildFooterTermsBlock_(shKP, row, termsInfo, totalsInfo);
+
+    kp_applyGlobalFontSize_(shKP, KP_CFG.FONT_SIZE);
+    kp_applyNumberFormats_(shKP, cartInfo.firstDataRow, cartInfo.lastDataRow, totalsInfo);
+
+    try { shKP.hideColumns(KP_CFG.CART_COLS.UID); } catch (e) {}
+
+    shKP.setFrozenRows(0);
+    shKP.setFrozenColumns(0);
+    shKP.setActiveSelection('A1');
+  } finally {
+    try { lock.releaseLock(); } catch (e) {}
+  }
+}
+
+/* ========================= MODE: UPDATE (без полной очистки) ========================= */
+
+function kp_buildKP_update_() {
+  const lock = LockService.getDocumentLock();
+  if (!lock.tryLock(30000)) return;
+
+  try {
+    const ss = SpreadsheetApp.getActive();
+    const ui = SpreadsheetApp.getUi();
+
+    const shPrice = ss.getSheetByName(KP_CFG.SHEET_PRICE);
+    if (!shPrice) throw new Error('Не найден лист "Прайс".');
+
+    const selectedCount = kp_countSelectedPositionsInPrice_(shPrice);
+    if (selectedCount <= 0) {
+      ui.alert('КП не обновлено', 'В листе "Прайс" не выбрана ни одна позиция (Кол-во > 0).', ui.ButtonSet.OK);
+      ss.setActiveSheet(shPrice);
+      return;
+    }
+
+    const shKP = ss.getSheetByName(KP_CFG.SHEET_KP);
+    if (!shKP) {
+      kp_buildKP_reset_();
+      return;
+    }
+
+    ss.setActiveSheet(shKP);
+    kp_ensureSheetSize_(shKP, 200, KP_CFG.COL_END);
+
+    const ok = kp_updateCartAndTotalsInPlace_(shKP, shPrice);
+
+    if (!ok) {
+      ui.alert('Обновление без очистки невозможно', 'Не удалось найти структуру КП. Выполняю формирование заново с очисткой.', ui.ButtonSet.OK);
+      kp_buildKP_reset_();
+      return;
+    }
+
+    try { shKP.hideColumns(KP_CFG.CART_COLS.UID); } catch (e) {}
+    shKP.setActiveSelection('A1');
+  } finally {
+    try { lock.releaseLock(); } catch (e) {}
+  }
+}
+
+/**
+ * Обновление "в месте":
+ * - НЕ трогаем верхние поля (заказчик/адрес/договор/менеджер и т.п.)
+ * - Пересобираем ТОЛЬКО корзину и обновляем формулы итогов под новый диапазон
+ * - Сохраняем "Примечание" и индивидуальную скидку по UID (если были заполнены вручную)
+ *
+ * Возвращает true/false (смогли ли обновить без полной очистки).
+ */
+function kp_updateCartAndTotalsInPlace_(shKP, shPrice) {
+  // 1) Находим строку заголовка корзины ("Артикул" в колонке A)
+  const cartHeaderRow = kp_findRowByExactTextInColA_(shKP, 'Артикул', 1, 800);
+  if (!cartHeaderRow) return false;
+
+  // 2) Находим строку, где начинается блок итогов
+  let totalsStartRow =
+    kp_findRowByExactTextInColA_(shKP, 'Итого за оборудование, руб', 1, 3000) ||
+    kp_findRowByExactTextInColA_(shKP, 'Итого оборудование, руб', 1, 3000);
+  if (!totalsStartRow) return false;
+
+  // 3) Читаем текущую шапку корзины, определяем колонки UID/Примечание/Скидка
+  const hdrVals = shKP.getRange(cartHeaderRow, 1, 1, KP_CFG.COL_END).getDisplayValues()[0];
+  const hdrNorm = hdrVals.map(kp_normHeader_);
+
+  const colArt = kp_colByExactHeader_(hdrNorm, 'артикул') || 1;
+  const colNote = kp_colByExactHeader_(hdrNorm, 'примечание') || 12;
+  const colDiscount = kp_colByContainsAll_(hdrNorm, ['скидка', '%']) || 13;
+  const colUid = kp_colByExactHeader_(hdrNorm, 'uid') || 14;
+
+  // 4) Считываем существующие Примечания/Скидку по UID
+  const old = kp_readExistingCartManualByUid_(shKP, cartHeaderRow, totalsStartRow, colUid, colNote, colDiscount, colArt);
+
+  // 5) Берём новые позиции из Прайса (ТОЛЬКО qty>0 и uid != '')
+  const priceImgByRow = kp_buildImagesByRow_(shPrice);
+  const priceRows = kp_readPriceRows_(shPrice);
+  const cartRows = priceRows.filter(r => (Number(r.qty) || 0) > 0 && String(r.uid || '').trim() !== '');
+  if (!cartRows.length) return false;
+
+  // 6) Гарантируем, что между корзиной и итогами есть место
+  const targetTotalsStart = cartHeaderRow + cartRows.length + 2;
+  if (totalsStartRow < targetTotalsStart) {
+    const delta = targetTotalsStart - totalsStartRow;
+    shKP.insertRowsBefore(totalsStartRow, delta);
+    totalsStartRow += delta; // сдвинулась вниз
+  }
+
+  // 7) Удаляем изображения в старой зоне корзины (чтобы не наслаивались)
+  kp_removeImagesInRowRange_(shKP, cartHeaderRow + 1, totalsStartRow - 2);
+
+  // 8) Обновляем шапку корзины
+  const headers = [
+    'Артикул', 'Вид 1', 'Вид 2', 'Наименование / размеры', 'Ед.',
+    'Стоимость оборудования', 'Кол-во', 'Всего за оборудование',
+    'Стоимость монтажа', 'Всего за монтаж', 'Итого',
+    'Примечание', 'Скидка (-) / Наценка (+), %', 'UID'
+  ];
+  shKP.getRange(cartHeaderRow, 1, 1, KP_CFG.COL_END).setValues([headers]);
+  shKP.getRange(cartHeaderRow, 1, 1, KP_CFG.COL_END)
+    .setFontWeight('bold')
+    .setBackground('#f5f5f5')
+    .setHorizontalAlignment('center')
+    .setVerticalAlignment('middle')
+    .setWrap(true);
+
+  // 9) Чистим старые строки корзины (в A:N)
+  const dataStartRow = cartHeaderRow + 1;
+  const clearRows = Math.max(old.oldRowsCount, cartRows.length);
+  if (clearRows > 0) {
+    shKP.getRange(dataStartRow, 1, clearRows, KP_CFG.COL_END).clearContent();
+    for (let rr = dataStartRow + cartRows.length; rr < dataStartRow + clearRows; rr++) {
+      try { shKP.setRowHeight(rr, KP_CFG.DEFAULT_ROW_HEIGHT); } catch (e) {}
+    }
+  }
+
+  // 10) Записываем новую корзину
+  let outRow = dataStartRow;
+  for (const item of cartRows) {
+    shKP.setRowHeight(outRow, 200);
+
+    shKP.getRange(outRow, 1).setValue(item.art);
+
+    kp_setViewImageFromPrice_(shKP, shPrice, priceImgByRow, outRow, 2, item.sourceRow, item.sourceColView1, item.view1);
+    kp_setViewImageFromPrice_(shKP, shPrice, priceImgByRow, outRow, 3, item.sourceRow, item.sourceColView2, item.view2);
+
+    shKP.getRange(outRow, 4).setValue(item.name);
+    shKP.getRange(outRow, 5).setValue(item.unit);
+
+    // UID (N)
+    shKP.getRange(outRow, KP_CFG.CART_COLS.UID).setValue(item.uid || '').setNumberFormat(KP_CFG.NUM_FMT_TEXT);
+
+    // Примечание (L) — восстановим по UID если было
+    const prevManual = old.byUid[item.uid] || null;
+    const note = prevManual ? (prevManual.note || '') : '';
+    shKP.getRange(outRow, 12).setValue(note).setNumberFormat(KP_CFG.NUM_FMT_TEXT);
+
+    // Скидка % (M) — если было вручную, восстановим значением; иначе формула на общий дисконт
+    if (prevManual && prevManual.discount !== null && prevManual.discount !== '') {
+      shKP.getRange(outRow, 13).setValue(prevManual.discount);
+    } else {
+      shKP.getRange(outRow, 13).setFormula(`=$D$${KP_CFG.PARAM_ROW_DISCOUNT}`);
+    }
+    shKP.getRange(outRow, 13).setNumberFormat(KP_CFG.NUM_FMT_PCT);
+
+    // F: цена с учетом M (скидка по строке)
+    const ruPrice = kp_toRuNumberLiteral_(item.cost);
+    shKP.getRange(outRow, 6).setFormula(`=${ruPrice}*(1+M${outRow}/100)`);
+
+    // G: qty
+    shKP.getRange(outRow, 7).setValue(item.qty);
+
+    // H..K
+    shKP.getRange(outRow, 8).setFormulaR1C1('=RC[-2]*RC[-1]');                // H = F*G
+    shKP.getRange(outRow, 9).setFormula(`=F${outRow}*$D$${KP_CFG.PARAM_ROW_INSTALL_PCT}/100`); // I
+    shKP.getRange(outRow, 10).setFormulaR1C1('=RC[-1]*RC[-3]');               // J = I*G
+    shKP.getRange(outRow, 11).setFormulaR1C1('=RC[-3]+RC[-1]');               // K = H+J
+
+    outRow++;
+  }
+
+  const lastDataRow = outRow - 1;
+  const dataCount = Math.max(0, lastDataRow - dataStartRow + 1);
+
+  // 11) Формат/границы для корзины
+  if (dataCount > 0) {
+    shKP.getRange(dataStartRow, 1, dataCount, KP_CFG.COL_END)
+      .setHorizontalAlignment('center')
+      .setVerticalAlignment('middle')
+      .setWrap(true);
+
+    shKP.getRange(dataStartRow, 6, dataCount, 1).setNumberFormat(KP_CFG.NUM_FMT_MONEY); // F
+    shKP.getRange(dataStartRow, 8, dataCount, 1).setNumberFormat(KP_CFG.NUM_FMT_MONEY); // H
+    shKP.getRange(dataStartRow, 9, dataCount, 1).setNumberFormat(KP_CFG.NUM_FMT_MONEY); // I
+    shKP.getRange(dataStartRow, 10, dataCount, 1).setNumberFormat(KP_CFG.NUM_FMT_MONEY); // J
+    shKP.getRange(dataStartRow, 11, dataCount, 1).setNumberFormat(KP_CFG.NUM_FMT_MONEY); // K
+    shKP.getRange(dataStartRow, 7, dataCount, 1).setNumberFormat(KP_CFG.NUM_FMT_INT);   // G
+    shKP.getRange(dataStartRow, 12, dataCount, 1).setNumberFormat(KP_CFG.NUM_FMT_TEXT); // L
+    shKP.getRange(dataStartRow, 14, dataCount, 1).setNumberFormat(KP_CFG.NUM_FMT_TEXT); // N
+  }
+
+  shKP.getRange(cartHeaderRow, 1, 1 + dataCount, KP_CFG.COL_END)
+    .setBorder(true, true, true, true, true, true);
+
+  // 12) Обновляем формулы итогов под новый диапазон ds..de
+  const ds = dataStartRow;
+  const de = lastDataRow;
+
+  // КЛЮЧЕВО: ищем строки итогов ТОЛЬКО начиная с totalsStartRow (иначе поймаем "Доставка, руб" из настроек)
+  const searchFrom = totalsStartRow;
+  const searchTo = 6000;
+
+  const rEquip =
+    kp_findRowByExactTextInColA_(shKP, 'Итого за оборудование, руб', searchFrom, searchTo) ||
+    kp_findRowByExactTextInColA_(shKP, 'Итого оборудование, руб', searchFrom, searchTo);
+
+  const rDel = kp_findRowByExactTextInColA_(shKP, 'Доставка, руб', searchFrom, searchTo);
+  const rInst = kp_findRowByExactTextInColA_(shKP, 'Монтаж, руб', searchFrom, searchTo);
+  const rPay = kp_findRowByExactTextInColA_(shKP, 'Итого к оплате, руб', searchFrom, searchTo);
+
+  const rVat =
+    kp_findRowByExactTextInColA_(shKP, 'В том числе НДС 22%, руб', searchFrom, searchTo) ||
+    kp_findRowByExactTextInColA_(shKP, 'НДС 22%, руб', searchFrom, searchTo);
+
+  if (rEquip) shKP.getRange(rEquip, 4).setFormula(`=SUM(H${ds}:H${de})`).setNumberFormat(KP_CFG.NUM_FMT_MONEY);
+  if (rDel) shKP.getRange(rDel, 4).setFormula(`=D${KP_CFG.PARAM_ROW_DELIVERY}`).setNumberFormat(KP_CFG.NUM_FMT_MONEY);
+  if (rInst) shKP.getRange(rInst, 4).setFormula(`=SUM(J${ds}:J${de})`).setNumberFormat(KP_CFG.NUM_FMT_MONEY);
+
+  if (rPay && rEquip && rInst && rDel) {
+    shKP.getRange(rPay, 4).setFormula(`=D${rEquip}+D${rInst}+D${rDel}`).setNumberFormat(KP_CFG.NUM_FMT_MONEY);
+  }
+  if (rVat && rPay) {
+    shKP.getRange(rVat, 4).setFormula(`=D${rPay}*22/122`).setNumberFormat(KP_CFG.NUM_FMT_MONEY);
+  }
+
+  // 13) UID колонка скрыта
+  try { shKP.hideColumns(KP_CFG.CART_COLS.UID); } catch (e) {}
+
+  return true;
+}
+
+/* ========================= HELPERS (общие) ========================= */
+
+function kp_ensureSheetSize_(sh, minRows, minCols) {
   const curRows = sh.getMaxRows();
   const curCols = sh.getMaxColumns();
-
   if (curRows < minRows) sh.insertRowsAfter(curRows, minRows - curRows);
   if (curCols < minCols) sh.insertColumnsAfter(curCols, minCols - curCols);
 }
 
-/**
- * НОВОЕ: быстрый подсчёт выбранных позиций в "Прайс"
- * Условие: qty > 0 И uid не пустой (строки групп отсекаются).
- * Возвращает число выбранных строк-товаров.
- */
-function countSelectedPositionsInPrice_(shPrice) {
+function kp_normHeader_(s) {
+  return String(s || '').replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+function kp_colByExactHeader_(hdrNorm, exact) {
+  const e = kp_normHeader_(exact);
+  const i = hdrNorm.indexOf(e);
+  return i >= 0 ? i + 1 : 0;
+}
+
+function kp_colByContainsAll_(hdrNorm, parts) {
+  const p = parts.map(kp_normHeader_);
+  for (let i = 0; i < hdrNorm.length; i++) {
+    const t = hdrNorm[i];
+    if (!t) continue;
+    if (p.every(x => t.includes(x))) return i + 1;
+  }
+  return 0;
+}
+
+function kp_findRowByExactTextInColA_(sh, text, r1, r2) {
+  const target = String(text || '').trim();
+  const last = Math.min(r2 || sh.getLastRow(), sh.getLastRow());
+  const start = Math.max(1, r1 || 1);
+  for (let r = start; r <= last; r++) {
+    const v = String(sh.getRange(r, 1).getDisplayValue() || '').trim();
+    if (v === target) return r;
+  }
+  return 0;
+}
+
+function kp_readExistingCartManualByUid_(shKP, cartHeaderRow, totalsStartRow, colUid, colNote, colDiscount, colArt) {
+  const byUid = {};
+  const start = cartHeaderRow + 1;
+  const end = Math.max(start, totalsStartRow - 2);
+
+  let oldRowsCount = 0;
+
+  for (let r = start; r <= end; r++) {
+    const art = String(shKP.getRange(r, colArt).getDisplayValue() || '').trim();
+    const uid = String(shKP.getRange(r, colUid).getDisplayValue() || '').trim();
+
+    if (!art && !uid) break;
+
+    oldRowsCount++;
+
+    if (!uid) continue;
+
+    const note = String(shKP.getRange(r, colNote).getDisplayValue() || '').trim();
+
+    const discountCell = shKP.getRange(r, colDiscount);
+    const f = String(discountCell.getFormula() || '');
+    let discount = null;
+    if (!f) {
+      const v = discountCell.getValue();
+      if (v !== '' && v !== null && v !== undefined) discount = v;
+    }
+
+    byUid[uid] = { note, discount };
+  }
+
+  return { byUid, oldRowsCount };
+}
+
+function kp_removeImagesInRowRange_(sh, rowFrom, rowTo) {
+  let imgs = [];
+  try { imgs = sh.getImages(); } catch (e) { imgs = []; }
+  imgs.forEach(img => {
+    try {
+      const r = img.getAnchorCell().getRow();
+      if (r >= rowFrom && r <= rowTo) img.remove();
+    } catch (e) {}
+  });
+}
+
+/* ========================= SELECTED COUNT IN PRICE ========================= */
+
+function kp_countSelectedPositionsInPrice_(shPrice) {
   const lastRow = shPrice.getLastRow();
   const lastCol = shPrice.getLastColumn();
   if (lastRow < 2) return 0;
 
-  // Прайс обычно с заголовками в 1-й строке, но на всякий случай поддержим 2-ю
   const cand1 = shPrice.getRange(1, 1, 1, lastCol).getValues()[0];
   const cand2 = shPrice.getRange(2, 1, 1, lastCol).getValues()[0];
 
   let headerRow = 1;
-  let map = headerMap_(cand1);
+  let map = kp_headerMap_(cand1);
   if (!map[KP_CFG.PRICE_HEADERS.UID] || !map[KP_CFG.PRICE_HEADERS.QTY]) {
-    map = headerMap_(cand2);
+    map = kp_headerMap_(cand2);
     headerRow = 2;
   }
+
   if (!map[KP_CFG.PRICE_HEADERS.UID] || !map[KP_CFG.PRICE_HEADERS.QTY]) {
-    // fallback: если заголовки не нашли — используем "тяжёлый" метод через readPriceRows_
-    try {
-      const rows = readPriceRows_(shPrice);
-      return rows.filter(r => (Number(r.qty) || 0) > 0 && String(r.uid || '').trim() !== '').length;
-    } catch (e) {
-      return 0;
-    }
+    const rows = kp_readPriceRows_(shPrice);
+    return rows.filter(r => (Number(r.qty) || 0) > 0 && String(r.uid || '').trim() !== '').length;
   }
 
-  const colUid = map[KP_CFG.PRICE_HEADERS.UID]; // 1-based
-  const colQty = map[KP_CFG.PRICE_HEADERS.QTY]; // 1-based
+  const colUid = map[KP_CFG.PRICE_HEADERS.UID];
+  const colQty = map[KP_CFG.PRICE_HEADERS.QTY];
 
   const dataStartRow = headerRow + 1;
   const numRows = lastRow - dataStartRow + 1;
@@ -119,80 +514,9 @@ function countSelectedPositionsInPrice_(shPrice) {
   return cnt;
 }
 
-function buildKP() {
-  const lock = LockService.getDocumentLock();
-  if (!lock.tryLock(30000)) return;
+/* ========================= RESET MODE BUILD BLOCKS ========================= */
 
-  try {
-    const ss = SpreadsheetApp.getActive();
-    const ui = SpreadsheetApp.getUi();
-
-    const shPrice = ss.getSheetByName(KP_CFG.SHEET_PRICE);
-    if (!shPrice) throw new Error('Не найден лист "Прайс".');
-
-    // НОВОЕ: если нет выбранных позиций — КП НЕ формируем
-    const selectedCount = countSelectedPositionsInPrice_(shPrice);
-    if (selectedCount <= 0) {
-      ui.alert('КП не сформировано', 'В листе "Прайс" не выбрана ни одна позиция (Кол-во > 0).', ui.ButtonSet.OK);
-      ss.setActiveSheet(shPrice);
-      return;
-    }
-
-    const shKP = ss.getSheetByName(KP_CFG.SHEET_KP) || ss.insertSheet(KP_CFG.SHEET_KP);
-    ss.setActiveSheet(shKP);
-
-    // FIX: перед любой работой с ширинами/скрытием обеспечиваем колонки
-    ensureSheetSize_(shKP, 200, KP_CFG.COL_END);
-
-    clearSheetHardAndResetSizes_(shKP);
-    setupKpColumns_(shKP);
-
-    // Шапка A1:L7
-    insertHeaderImageOverCells_(shKP, KP_CFG.HEADER_FILE_ID, 1, 1, 7, KP_CFG.COL_PRINT_END);
-
-    // Параметры
-    let row = 9;
-    row = buildParamsBlock_(shKP, row);
-
-    // Условия (верхний блок)
-    row += 1;
-    const termsInfo = buildTermsBlock_(shKP, row);
-    row = termsInfo.afterRow;
-
-    // Корзина
-    row += 2;
-    const cartInfo = buildCartBlockFromPrice_(shKP, shPrice, row);
-    row = cartInfo.afterRow;
-
-    // Итоги
-    row += 1;
-    const totalsInfo = buildTotalsBlock_(shKP, row, cartInfo.firstDataRow, cartInfo.lastDataRow);
-    row = totalsInfo.afterRow;
-
-    // Нижний блок "УСЛОВИЯ..."
-    row += 1;
-    buildFooterTermsBlock_(shKP, row, termsInfo, totalsInfo);
-
-    // Шрифт 20 на весь лист
-    applyGlobalFontSize_(shKP, KP_CFG.FONT_SIZE);
-
-    // Форматы чисел
-    applyNumberFormats_(shKP, cartInfo.firstDataRow, cartInfo.lastDataRow, totalsInfo);
-
-    // Скрываем UID колонку (N) всегда
-    try { shKP.hideColumns(KP_CFG.CART_COLS.UID); } catch (e) {}
-
-    shKP.setFrozenRows(0);
-    shKP.setFrozenColumns(0);
-    shKP.setActiveSelection('A1');
-  } finally {
-    try { lock.releaseLock(); } catch (e) {}
-  }
-}
-
-/* ----------------- ОЧИСТКА + СБРОС ----------------- */
-
-function clearSheetHardAndResetSizes_(sheet) {
+function kp_clearSheetHardAndResetSizes_(sheet) {
   sheet.setFrozenRows(0);
   sheet.setFrozenColumns(0);
 
@@ -216,66 +540,54 @@ function clearSheetHardAndResetSizes_(sheet) {
   sheet.setHiddenGridlines(false);
 }
 
-function setupKpColumns_(sh) {
-  // FIX: гарантируем колонки до N
-  ensureSheetSize_(sh, 50, KP_CFG.COL_END);
+function kp_setupKpColumns_(sh) {
+  kp_ensureSheetSize_(sh, 50, KP_CFG.COL_END);
 
-  sh.setColumnWidth(1, 180);  // A (Артикул)
-  sh.setColumnWidth(2, 200);  // B (Вид 1)
-  sh.setColumnWidth(3, 200);  // C (Вид 2)
-  sh.setColumnWidth(4, 360);  // D (Наименование)
-  sh.setColumnWidth(5, 60);   // E
-  sh.setColumnWidth(6, 150);  // F
-  sh.setColumnWidth(7, 70);   // G
-  sh.setColumnWidth(8, 160);  // H
-  sh.setColumnWidth(9, 160);  // I
-  sh.setColumnWidth(10, 160); // J
-  sh.setColumnWidth(11, 160); // K
-  sh.setColumnWidth(12, 260); // L (Примечание)
-  sh.setColumnWidth(13, 120); // M (Скидка %)
-  sh.setColumnWidth(14, 60);  // N (UID, скрыто)
+  sh.setColumnWidth(1, 180);
+  sh.setColumnWidth(2, 200);
+  sh.setColumnWidth(3, 200);
+  sh.setColumnWidth(4, 360);
+  sh.setColumnWidth(5, 60);
+  sh.setColumnWidth(6, 150);
+  sh.setColumnWidth(7, 70);
+  sh.setColumnWidth(8, 160);
+  sh.setColumnWidth(9, 160);
+  sh.setColumnWidth(10, 160);
+  sh.setColumnWidth(11, 160);
+  sh.setColumnWidth(12, 260);
+  sh.setColumnWidth(13, 120);
+  sh.setColumnWidth(14, 60);
 
   for (let r = 1; r <= 7; r++) sh.setRowHeight(r, 30);
 }
 
-/* ---------------------- ШАПКА ---------------------- */
-
-function insertHeaderImageOverCells_(sh, fileId, startRow, startCol, endRow, endCol) {
+function kp_insertHeaderImageOverCells_(sh, fileId, startRow, startCol, endRow, endCol) {
   try { sh.getImages().forEach(img => img.remove()); } catch (e) {}
 
   const blob = DriveApp.getFileById(fileId).getBlob();
   const img = sh.insertImage(blob, startCol, startRow);
 
-  const widthPx = sumColumnWidths_(sh, startCol, endCol);
-  const heightPx = sumRowHeights_(sh, startRow, endRow);
+  const widthPx = kp_sumColumnWidths_(sh, startCol, endCol);
+  const heightPx = kp_sumRowHeights_(sh, startRow, endRow);
 
   img.setAnchorCell(sh.getRange(startRow, startCol));
   img.setWidth(widthPx);
   img.setHeight(heightPx);
 }
 
-function sumColumnWidths_(sh, c1, c2) {
+function kp_sumColumnWidths_(sh, c1, c2) {
   let w = 0;
   for (let c = c1; c <= c2; c++) w += sh.getColumnWidth(c);
   return w;
 }
-
-function sumRowHeights_(sh, r1, r2) {
+function kp_sumRowHeights_(sh, r1, r2) {
   let h = 0;
   for (let r = r1; r <= r2; r++) h += sh.getRowHeight(r);
   return h;
 }
 
-/* ---------------------- ПАРАМЕТРЫ + НАСТРОЙКИ РАСЧЁТА ---------------------- */
-
-function buildParamsBlock_(sh, startRow) {
-  // Строка 9: пустая
-  sh.getRange(startRow, 1, 1, KP_CFG.COL_END)
-    .merge()
-    .setValue('')
-    .setBackground(null)
-    .setFontWeight('normal')
-    .setHorizontalAlignment('left');
+function kp_buildParamsBlock_(sh, startRow) {
+  sh.getRange(startRow, 1, 1, KP_CFG.COL_END).merge().setValue('').setBackground(null);
 
   const baseLabels = [
     'Наименование Заказчика',
@@ -293,16 +605,14 @@ function buildParamsBlock_(sh, startRow) {
   for (let i = 0; i < baseLabels.length; i++) {
     const r = row0 + i;
 
-    sh.getRange(r, 1, 1, 3)
-      .merge()
+    sh.getRange(r, 1, 1, 3).merge()
       .setValue(baseLabels[i])
       .setFontWeight('bold')
       .setHorizontalAlignment('left')
       .setVerticalAlignment('middle')
       .setWrap(true);
 
-    const input = sh.getRange(r, 4, 1, (KP_CFG.COL_END - 3))
-      .merge()
+    const input = sh.getRange(r, 4, 1, (KP_CFG.COL_END - 3)).merge()
       .setValue('')
       .setHorizontalAlignment('left')
       .setVerticalAlignment('middle')
@@ -315,7 +625,6 @@ function buildParamsBlock_(sh, startRow) {
       sh.getRange(r, 4).setValue(new Date());
     }
 
-    // выпадающий список менеджеров
     if (baseLabels[i] === 'Менеджер') {
       try {
         const ss = SpreadsheetApp.getActive();
@@ -324,7 +633,7 @@ function buildParamsBlock_(sh, startRow) {
         if (shRef) {
           const last = Math.max(shRef.getLastRow(), 2);
           const num = Math.max(1, last - 1);
-          const listRange = shRef.getRange(2, 1, num, 1); // A2:A
+          const listRange = shRef.getRange(2, 1, num, 1);
           const rule = SpreadsheetApp.newDataValidation()
             .requireValueInRange(listRange, true)
             .setAllowInvalid(false)
@@ -334,7 +643,6 @@ function buildParamsBlock_(sh, startRow) {
       } catch (e) {}
     }
 
-    // телефон по менеджеру
     if (baseLabels[i] === 'Телефон') {
       try {
         const rMgr = row0 + baseLabels.indexOf('Менеджер');
@@ -346,14 +654,11 @@ function buildParamsBlock_(sh, startRow) {
     }
   }
 
-  // пустая строка 17
   const rBlank = row0 + baseLabels.length; // 17
   sh.getRange(rBlank, 1, 1, KP_CFG.COL_END).merge().setValue('').setBackground(null);
 
-  // заголовок "Настройки расчёта" — 18
   const rSettingsTitle = rBlank + 1; // 18
-  sh.getRange(rSettingsTitle, 1, 1, KP_CFG.COL_END)
-    .merge()
+  sh.getRange(rSettingsTitle, 1, 1, KP_CFG.COL_END).merge()
     .setValue('Настройки расчёта')
     .setFontWeight('bold')
     .setBackground('#eeeeee')
@@ -368,7 +673,7 @@ function buildParamsBlock_(sh, startRow) {
   ];
 
   for (let i = 0; i < settingsLabels.length; i++) {
-    const r = rSettingsTitle + 1 + i; // 19..21
+    const r = rSettingsTitle + 1 + i;
 
     sh.getRange(r, 1, 1, 3).merge()
       .setValue(settingsLabels[i])
@@ -403,11 +708,8 @@ function buildParamsBlock_(sh, startRow) {
   return lastRow + 1;
 }
 
-/* ------------------- УСЛОВИЯ / СРОКИ (верхний блок) ------------------- */
-
-function buildTermsBlock_(sh, startRow) {
-  sh.getRange(startRow, 1, 1, KP_CFG.COL_END)
-    .merge()
+function kp_buildTermsBlock_(sh, startRow) {
+  sh.getRange(startRow, 1, 1, KP_CFG.COL_END).merge()
     .setValue('Условия и сроки поставки (изменяемые)')
     .setFontWeight('bold')
     .setBackground('#eeeeee')
@@ -424,8 +726,9 @@ function buildTermsBlock_(sh, startRow) {
     .setValue('Предоплата за оборудование составляет:')
     .setWrap(true).setHorizontalAlignment('left').setVerticalAlignment('middle');
 
-  const prepayCell = sh.getRange(rPrepay, 10, 1, 4).merge();
-  prepayCell.setValue(0.7).setNumberFormat('0%')
+  sh.getRange(rPrepay, 10, 1, 4).merge()
+    .setValue(0.7)
+    .setNumberFormat('0%')
     .setHorizontalAlignment('left')
     .setVerticalAlignment('middle');
 
@@ -466,30 +769,18 @@ function buildTermsBlock_(sh, startRow) {
   };
 }
 
-/* ------------------------ КОРЗИНА ------------------------ */
-
-function buildCartBlockFromPrice_(shKP, shPrice, startRow) {
+function kp_buildCartBlockFromPrice_(shKP, shPrice, startRow) {
   const headerRow = startRow;
 
   const headers = [
-    'Артикул',
-    'Вид 1',
-    'Вид 2',
-    'Наименование / размеры',
-    'Ед.',
-    'Стоимость оборудования',
-    'Кол-во',
-    'Всего за оборудование',
-    'Стоимость монтажа',
-    'Всего за монтаж',
-    'Итого',
-    'Примечание',
-    'Скидка (-) / Наценка (+), %',
-    'UID',
+    'Артикул', 'Вид 1', 'Вид 2', 'Наименование / размеры', 'Ед.',
+    'Стоимость оборудования', 'Кол-во', 'Всего за оборудование',
+    'Стоимость монтажа', 'Всего за монтаж', 'Итого',
+    'Примечание', 'Скидка (-) / Наценка (+), %', 'UID'
   ];
 
-  shKP.getRange(headerRow, 1, 1, headers.length)
-    .setValues([headers])
+  shKP.getRange(headerRow, 1, 1, KP_CFG.COL_END).setValues([headers]);
+  shKP.getRange(headerRow, 1, 1, KP_CFG.COL_END)
     .setFontWeight('bold')
     .setBackground('#f5f5f5')
     .setHorizontalAlignment('center')
@@ -498,68 +789,45 @@ function buildCartBlockFromPrice_(shKP, shPrice, startRow) {
 
   try { shKP.hideColumns(KP_CFG.CART_COLS.UID); } catch (e) {}
 
-  const priceImgByRow = buildImagesByRow_(shPrice);
-  const priceRows = readPriceRows_(shPrice);
+  const priceImgByRow = kp_buildImagesByRow_(shPrice);
+  const priceRows = kp_readPriceRows_(shPrice);
 
-  // ВАЖНО: берём только реальные товары (есть UID) и qty > 0
-  const cartRows = priceRows.filter(r =>
-    (Number(r.qty) || 0) > 0 && String(r.uid || '').trim() !== ''
-  );
+  // ВАЖНО: только реальные товары (есть UID) и qty > 0
+  const cartRows = priceRows.filter(r => (Number(r.qty) || 0) > 0 && String(r.uid || '').trim() !== '');
 
   let outRow = headerRow + 1;
   const firstDataRow = outRow;
-
-  // (теоретически сюда уже не должны попадать 0 позиций, т.к. мы проверили в buildKP,
-  //  но оставляем защиту)
-  if (cartRows.length === 0) {
-    shKP.getRange(outRow, 1, 1, KP_CFG.COL_END)
-      .merge()
-      .setValue('В «Прайс» нет выбранных товарных строк (Кол-во > 0 и UID заполнен).')
-      .setHorizontalAlignment('center')
-      .setVerticalAlignment('middle')
-      .setWrap(true);
-
-    shKP.getRange(headerRow, 1, (outRow - headerRow) + 1, KP_CFG.COL_END)
-      .setBorder(true, true, true, true, true, true);
-
-    return { headerRow, firstDataRow, lastDataRow: outRow, afterRow: outRow + 1 };
-  }
 
   for (const item of cartRows) {
     shKP.setRowHeight(outRow, 200);
 
     shKP.getRange(outRow, 1).setValue(item.art);
 
-    setViewImageFromPrice_(shKP, shPrice, priceImgByRow, outRow, 2, item.sourceRow, item.sourceColView1, item.view1);
-    setViewImageFromPrice_(shKP, shPrice, priceImgByRow, outRow, 3, item.sourceRow, item.sourceColView2, item.view2);
+    kp_setViewImageFromPrice_(shKP, shPrice, priceImgByRow, outRow, 2, item.sourceRow, item.sourceColView1, item.view1);
+    kp_setViewImageFromPrice_(shKP, shPrice, priceImgByRow, outRow, 3, item.sourceRow, item.sourceColView2, item.view2);
 
     shKP.getRange(outRow, 4).setValue(item.name);
     shKP.getRange(outRow, 5).setValue(item.unit);
 
-    // M скидка%
-    shKP.getRange(outRow, KP_CFG.CART_COLS.DISCOUNT_PCT).setFormula(`=$D$${KP_CFG.PARAM_ROW_DISCOUNT}`);
+    shKP.getRange(outRow, 13).setFormula(`=$D$${KP_CFG.PARAM_ROW_DISCOUNT}`).setNumberFormat(KP_CFG.NUM_FMT_PCT); // M
+    shKP.getRange(outRow, 14).setValue(item.uid || '').setNumberFormat(KP_CFG.NUM_FMT_TEXT); // N
 
-    // N UID (скрыто)
-    shKP.getRange(outRow, KP_CFG.CART_COLS.UID).setValue(item.uid || '').setNumberFormat(KP_CFG.NUM_FMT_TEXT);
+    shKP.getRange(outRow, 12).setValue('').setNumberFormat(KP_CFG.NUM_FMT_TEXT); // L note
 
-    // L Примечание
-    shKP.getRange(outRow, 12).setValue('');
-
-    // F цена с учетом скидки%
-    const ruPrice = toRuNumberLiteral_(item.cost);
+    const ruPrice = kp_toRuNumberLiteral_(item.cost);
     shKP.getRange(outRow, 6).setFormula(`=${ruPrice}*(1+M${outRow}/100)`);
 
-    shKP.getRange(outRow, 7).setValue(item.qty); // G
-    shKP.getRange(outRow, 8).setFormulaR1C1('=RC[-2]*RC[-1]'); // H
-    shKP.getRange(outRow, 9).setFormula(`=F${outRow}*$D$${KP_CFG.PARAM_ROW_INSTALL_PCT}/100`); // I
-    shKP.getRange(outRow, 10).setFormulaR1C1('=RC[-1]*RC[-3]'); // J
-    shKP.getRange(outRow, 11).setFormulaR1C1('=RC[-3]+RC[-1]'); // K
+    shKP.getRange(outRow, 7).setValue(item.qty);
+    shKP.getRange(outRow, 8).setFormulaR1C1('=RC[-2]*RC[-1]');
+    shKP.getRange(outRow, 9).setFormula(`=F${outRow}*$D$${KP_CFG.PARAM_ROW_INSTALL_PCT}/100`);
+    shKP.getRange(outRow, 10).setFormulaR1C1('=RC[-1]*RC[-3]');
+    shKP.getRange(outRow, 11).setFormulaR1C1('=RC[-3]+RC[-1]');
 
     outRow++;
   }
 
   const lastDataRow = outRow - 1;
-  const dataCount = lastDataRow - firstDataRow + 1;
+  const dataCount = Math.max(0, lastDataRow - firstDataRow + 1);
 
   if (dataCount > 0) {
     shKP.getRange(firstDataRow, 1, dataCount, KP_CFG.COL_END)
@@ -568,13 +836,142 @@ function buildCartBlockFromPrice_(shKP, shPrice, startRow) {
       .setWrap(true);
   }
 
-  shKP.getRange(headerRow, 1, outRow - headerRow, KP_CFG.COL_END)
+  shKP.getRange(headerRow, 1, 1 + dataCount, KP_CFG.COL_END)
     .setBorder(true, true, true, true, true, true);
 
   return { headerRow, firstDataRow, lastDataRow, afterRow: outRow };
 }
 
-function toRuNumberLiteral_(v) {
+function kp_buildTotalsBlock_(sh, startRow, firstDataRow, lastDataRow) {
+  const r0 = startRow;
+  const ds = Math.max(firstDataRow || 0, 1);
+  const de = Math.max(lastDataRow || ds, ds);
+
+  const setLine = (row, label, formula) => {
+    sh.getRange(row, 1, 1, 3).merge()
+      .setValue(label)
+      .setFontWeight('bold')
+      .setHorizontalAlignment('left')
+      .setVerticalAlignment('middle')
+      .setWrap(true);
+
+    sh.getRange(row, 4)
+      .setFormula(formula)
+      .setNumberFormat(KP_CFG.NUM_FMT_MONEY)
+      .setHorizontalAlignment('left')
+      .setVerticalAlignment('middle')
+      .setWrap(true);
+  };
+
+  setLine(r0, 'Итого за оборудование, руб', `=SUM(H${ds}:H${de})`);
+  setLine(r0 + 1, 'Доставка, руб', `=D${KP_CFG.PARAM_ROW_DELIVERY}`);
+  setLine(r0 + 2, 'Монтаж, руб', `=SUM(J${ds}:J${de})`);
+  setLine(r0 + 3, 'Итого к оплате, руб', `=D${r0}+D${r0 + 2}+D${r0 + 1}`);
+  setLine(r0 + 4, 'В том числе НДС 22%, руб', `=D${r0 + 3}*22/122`);
+
+  sh.getRange(r0, 1, 5, 4).setBorder(true, true, true, true, true, true);
+
+  return {
+    afterRow: r0 + 5,
+    cells: {
+      equipmentTotal: `D${r0}`,
+      delivery: `D${r0 + 1}`,
+      installTotal: `D${r0 + 2}`,
+      toPay: `D${r0 + 3}`,
+      vat: `D${r0 + 4}`,
+    },
+  };
+}
+
+function kp_buildFooterTermsBlock_(sh, startRow, termsInfo, totalsInfo) {
+  sh.getRange(startRow, 1, 1, KP_CFG.COL_END).merge()
+    .setValue('УСЛОВИЯ И СРОКИ ПОСТАВКИ :')
+    .setFontWeight('bold')
+    .setHorizontalAlignment('left')
+    .setVerticalAlignment('middle')
+    .setWrap(true);
+
+  const r1 = startRow + 1;
+  const r2 = startRow + 2;
+  const r3 = startRow + 3;
+  const r4 = startRow + 4;
+  const r5 = startRow + 5;
+  const r6 = startRow + 6;
+  const r7 = startRow + 7;
+
+  const lineFormula = (r, formula) => {
+    sh.getRange(r, 1, 1, KP_CFG.COL_END).merge()
+      .setFormula(formula)
+      .setHorizontalAlignment('left')
+      .setVerticalAlignment('middle')
+      .setWrap(true);
+  };
+
+  const lineValue = (r, value) => {
+    sh.getRange(r, 1, 1, KP_CFG.COL_END).merge()
+      .setValue(value)
+      .setHorizontalAlignment('left')
+      .setVerticalAlignment('middle')
+      .setWrap(true);
+  };
+
+  lineFormula(
+    r1,
+    `="Предоплата за оборудование составляет: "&TEXT(${termsInfo.cells.prepayPct};"0%")&", что составляет "&TEXT(${totalsInfo.cells.equipmentTotal}*${termsInfo.cells.prepayPct};"#,##0.00")&" рублей"`
+  );
+
+  lineValue(
+    r2,
+    'Оставшаяся сумма оплачивается в течение 3-х дней с даты уведомления о готовности к отгрузке в Раменском районе, сельском поселении Ганусовское, промпарк A107'
+  );
+
+  lineFormula(r3, `="Срок поставки Основное производство исчисляется с момента поступления предоплаты на р/счет и составляет: "&${termsInfo.cells.mainLead}`);
+  lineFormula(r4, `="Срок поставки ЭКО-серия исчисляется с момента поступления предоплаты на р/счет и составляет: "&${termsInfo.cells.ecoLead}`);
+
+  lineValue(r5, 'Оборудование поставляется в упаковке в разобранном/частично собранном виде');
+  lineValue(r6, 'Срок поставки может быть изменен в случае изменения технического задания, либо при необходимости внесения изменений заказчиком в конструкцию изделий');
+
+  lineFormula(r7, `="Данное КП действительно в течение: "&${termsInfo.cells.validityDays}&" дней"`);
+
+  return r7 + 1;
+}
+
+function kp_applyGlobalFontSize_(sh, size) {
+  try {
+    const maxR = Math.max(sh.getMaxRows(), sh.getLastRow(), 1);
+    const maxC = Math.max(sh.getMaxColumns(), sh.getLastColumn(), 1);
+    sh.getRange(1, 1, maxR, Math.min(maxC, KP_CFG.COL_END)).setFontSize(size);
+  } catch (e) {}
+}
+
+function kp_applyNumberFormats_(sh, firstDataRow, lastDataRow, totalsInfo) {
+  if (firstDataRow && lastDataRow && lastDataRow >= firstDataRow) {
+    const n = lastDataRow - firstDataRow + 1;
+
+    sh.getRange(firstDataRow, 6, n, 1).setNumberFormat(KP_CFG.NUM_FMT_MONEY); // F
+    sh.getRange(firstDataRow, 8, n, 1).setNumberFormat(KP_CFG.NUM_FMT_MONEY); // H
+    sh.getRange(firstDataRow, 9, n, 1).setNumberFormat(KP_CFG.NUM_FMT_MONEY); // I
+    sh.getRange(firstDataRow, 10, n, 1).setNumberFormat(KP_CFG.NUM_FMT_MONEY); // J
+    sh.getRange(firstDataRow, 11, n, 1).setNumberFormat(KP_CFG.NUM_FMT_MONEY); // K
+
+    sh.getRange(firstDataRow, 7, n, 1).setNumberFormat(KP_CFG.NUM_FMT_INT);   // G
+    sh.getRange(firstDataRow, 12, n, 1).setNumberFormat(KP_CFG.NUM_FMT_TEXT); // L
+    sh.getRange(firstDataRow, 13, n, 1).setNumberFormat(KP_CFG.NUM_FMT_PCT);  // M
+    sh.getRange(firstDataRow, 14, n, 1).setNumberFormat(KP_CFG.NUM_FMT_TEXT); // N
+  }
+
+  if (totalsInfo && totalsInfo.cells) {
+    try { sh.getRange(totalsInfo.cells.equipmentTotal).setNumberFormat(KP_CFG.NUM_FMT_MONEY); } catch (e) {}
+    try { sh.getRange(totalsInfo.cells.delivery).setNumberFormat(KP_CFG.NUM_FMT_MONEY); } catch (e) {}
+    try { sh.getRange(totalsInfo.cells.installTotal).setNumberFormat(KP_CFG.NUM_FMT_MONEY); } catch (e) {}
+    try { sh.getRange(totalsInfo.cells.toPay).setNumberFormat(KP_CFG.NUM_FMT_MONEY); } catch (e) {}
+    try { sh.getRange(totalsInfo.cells.vat).setNumberFormat(KP_CFG.NUM_FMT_MONEY); } catch (e) {}
+  }
+}
+
+/* ========================= PRICE READ + IMAGES ========================= */
+
+function kp_toRuNumberLiteral_(v) {
   if (typeof v === 'number') return String(v).replace('.', ',');
   let s = String(v ?? '').trim();
   if (!s) return '0';
@@ -583,9 +980,9 @@ function toRuNumberLiteral_(v) {
   return s;
 }
 
-function setViewImageFromPrice_(shKP, shPrice, priceImgByRow, targetRow, targetCol, sourceRow, sourceCol, anyVal) {
+function kp_setViewImageFromPrice_(shKP, shPrice, priceImgByRow, targetRow, targetCol, sourceRow, sourceCol, anyVal) {
   const targetCell = shKP.getRange(targetRow, targetCol);
-  const url = extractImageUrl_(anyVal);
+  const url = kp_extractImageUrl_(anyVal);
 
   if (url) {
     const w = shKP.getColumnWidth(targetCol);
@@ -598,7 +995,7 @@ function setViewImageFromPrice_(shKP, shPrice, priceImgByRow, targetRow, targetC
 
   if (!sourceRow || !sourceCol) return;
 
-  const img = findNearestImageInRow_(priceImgByRow, sourceRow, sourceCol, 3);
+  const img = kp_findNearestImageInRow_(priceImgByRow, sourceRow, sourceCol, 3);
   if (!img) return;
 
   const blob = img.getBlob();
@@ -612,7 +1009,7 @@ function setViewImageFromPrice_(shKP, shPrice, priceImgByRow, targetRow, targetC
   inserted.setHeight(Math.max(10, h - 10));
 }
 
-function buildImagesByRow_(sheet) {
+function kp_buildImagesByRow_(sheet) {
   const byRow = {};
   let imgs = [];
   try { imgs = sheet.getImages(); } catch (e) { imgs = []; }
@@ -631,7 +1028,7 @@ function buildImagesByRow_(sheet) {
   return byRow;
 }
 
-function findNearestImageInRow_(byRow, row, desiredCol, radiusCols) {
+function kp_findNearestImageInRow_(byRow, row, desiredCol, radiusCols) {
   const arr = byRow[row];
   if (!arr || arr.length === 0) return null;
 
@@ -648,9 +1045,7 @@ function findNearestImageInRow_(byRow, row, desiredCol, radiusCols) {
   return best;
 }
 
-/* --------------------- ЧТЕНИЕ ПРАЙСА (RichText URL) --------------------- */
-
-function readPriceRows_(shPrice) {
+function kp_readPriceRows_(shPrice) {
   const lastRow = shPrice.getLastRow();
   const lastCol = shPrice.getLastColumn();
   if (lastRow < 2) return [];
@@ -658,12 +1053,12 @@ function readPriceRows_(shPrice) {
   const cand1 = shPrice.getRange(1, 1, 1, lastCol).getValues()[0];
   const cand2 = shPrice.getRange(2, 1, 1, lastCol).getValues()[0];
 
-  let headerRow = 0;
-  let map = headerMap_(cand1);
+  let headerRowOffset = 0; // 0 => заголовок в 1-й строке
+  let map = kp_headerMap_(cand1);
 
   if (!map[KP_CFG.PRICE_HEADERS.QTY] || !map[KP_CFG.PRICE_HEADERS.COST]) {
-    map = headerMap_(cand2);
-    headerRow = 1;
+    map = kp_headerMap_(cand2);
+    headerRowOffset = 1; // заголовок во 2-й строке
   }
   if (!map[KP_CFG.PRICE_HEADERS.QTY] || !map[KP_CFG.PRICE_HEADERS.COST]) return [];
 
@@ -680,7 +1075,7 @@ function readPriceRows_(shPrice) {
     qty: col(KP_CFG.PRICE_HEADERS.QTY),
   };
 
-  const dataStartRow = headerRow + 2;
+  const dataStartRow = headerRowOffset + 2;
   const numRows = lastRow - dataStartRow + 1;
   if (numRows <= 0) return [];
 
@@ -710,8 +1105,8 @@ function readPriceRows_(shPrice) {
     const rich1 = (rtV1 && rtV1[i]) ? rtV1[i][0] : null;
     const rich2 = (rtV2 && rtV2[i]) ? rtV2[i][0] : null;
 
-    const url1 = extractUrlFromRichText_(rich1);
-    const url2 = extractUrlFromRichText_(rich2);
+    const url1 = kp_extractUrlFromRichText_(rich1);
+    const url2 = kp_extractUrlFromRichText_(rich2);
 
     const fallbackV1 = idx.v1 ? (rowF[idx.v1 - 1] || row[idx.v1 - 1]) : '';
     const fallbackV2 = idx.v2 ? (rowF[idx.v2 - 1] || row[idx.v2 - 1]) : '';
@@ -734,7 +1129,7 @@ function readPriceRows_(shPrice) {
   return out;
 }
 
-function extractUrlFromRichText_(rich) {
+function kp_extractUrlFromRichText_(rich) {
   try {
     if (!rich) return '';
     const u = rich.getLinkUrl && rich.getLinkUrl();
@@ -751,7 +1146,7 @@ function extractUrlFromRichText_(rich) {
   return '';
 }
 
-function headerMap_(headerRowValues) {
+function kp_headerMap_(headerRowValues) {
   const m = {};
   for (let c = 0; c < headerRowValues.length; c++) {
     const h = String(headerRowValues[c] ?? '').trim();
@@ -760,7 +1155,7 @@ function headerMap_(headerRowValues) {
   return m;
 }
 
-function extractImageUrl_(val) {
+function kp_extractImageUrl_(val) {
   if (!val) return '';
   const s = String(val).trim();
   const m = s.match(/IMAGE\(\s*"([^"]+)"\s*/i);
@@ -769,141 +1164,4 @@ function extractImageUrl_(val) {
   if (h && h[1]) return h[1];
   if (/^https?:\/\//i.test(s)) return s;
   return '';
-}
-
-/* ----------------------------- ИТОГИ ----------------------------- */
-
-function buildTotalsBlock_(sh, startRow, firstDataRow, lastDataRow) {
-  const r0 = startRow;
-  const ds = Math.max(firstDataRow || 0, 1);
-  const de = Math.max(lastDataRow || ds, ds);
-
-  const setLine = (row, label, formula, fmt) => {
-    sh.getRange(row, 1, 1, 3).merge()
-      .setValue(label)
-      .setFontWeight('bold')
-      .setHorizontalAlignment('left')
-      .setVerticalAlignment('middle')
-      .setWrap(true);
-
-    const cell = sh.getRange(row, 4); // D
-    cell.setFormula(formula)
-      .setNumberFormat(fmt || KP_CFG.NUM_FMT_MONEY)
-      .setHorizontalAlignment('left')
-      .setVerticalAlignment('middle')
-      .setWrap(true);
-  };
-
-  setLine(r0, 'Итого за оборудование, руб', `=SUM(H${ds}:H${de})`, KP_CFG.NUM_FMT_MONEY);
-  setLine(r0 + 1, 'Доставка, руб', `=D${KP_CFG.PARAM_ROW_DELIVERY}`, KP_CFG.NUM_FMT_MONEY);
-  setLine(r0 + 2, 'Монтаж, руб', `=SUM(J${ds}:J${de})`, KP_CFG.NUM_FMT_MONEY);
-
-  setLine(r0 + 3, 'Итого к оплате, руб', `=D${r0}+D${r0 + 2}+D${r0 + 1}`, KP_CFG.NUM_FMT_MONEY);
-  setLine(r0 + 4, 'В том числе НДС 22%, руб', `=D${r0 + 3}*22/122`, KP_CFG.NUM_FMT_MONEY);
-
-  sh.getRange(r0, 1, 5, 4).setBorder(true, true, true, true, true, true);
-
-  return {
-    afterRow: r0 + 5,
-    cells: {
-      equipmentTotal: `D${r0}`,
-      delivery: `D${r0 + 1}`,
-      installTotal: `D${r0 + 2}`,
-      toPay: `D${r0 + 3}`,
-      vat: `D${r0 + 4}`,
-    },
-  };
-}
-
-/* ------------------- НИЖНИЙ БЛОК УСЛОВИЙ ------------------- */
-
-function buildFooterTermsBlock_(sh, startRow, termsInfo, totalsInfo) {
-  sh.getRange(startRow, 1, 1, KP_CFG.COL_END)
-    .merge()
-    .setValue('УСЛОВИЯ И СРОКИ ПОСТАВКИ :')
-    .setFontWeight('bold')
-    .setHorizontalAlignment('left')
-    .setVerticalAlignment('middle')
-    .setWrap(true);
-
-  const r1 = startRow + 1;
-  const r2 = startRow + 2;
-  const r3 = startRow + 3;
-  const r4 = startRow + 4;
-  const r5 = startRow + 5;
-  const r6 = startRow + 6;
-  const r7 = startRow + 7;
-
-  const lineFormula = (r, formula) => {
-    sh.getRange(r, 1, 1, KP_CFG.COL_END)
-      .merge()
-      .setFormula(formula)
-      .setHorizontalAlignment('left')
-      .setVerticalAlignment('middle')
-      .setWrap(true);
-  };
-
-  const lineValue = (r, value) => {
-    sh.getRange(r, 1, 1, KP_CFG.COL_END)
-      .merge()
-      .setValue(value)
-      .setHorizontalAlignment('left')
-      .setVerticalAlignment('middle')
-      .setWrap(true);
-  };
-
-  lineFormula(
-    r1,
-    `="Предоплата за оборудование составляет: "&TEXT(${termsInfo.cells.prepayPct};"0%")&", что составляет "&TEXT(${totalsInfo.cells.equipmentTotal}*${termsInfo.cells.prepayPct};"#,##0.00")&" рублей"`
-  );
-
-  lineValue(
-    r2,
-    'Оставшаяся сумма оплачивается в течение 3-х дней с даты уведомления о готовности к отгрузке в Раменском районе, сельском поселении Ганусовское, промпарк A107'
-  );
-
-  lineFormula(r3, `="Срок поставки Основное производство исчисляется с момента поступления предоплаты на р/счет и составляет: "&${termsInfo.cells.mainLead}`);
-  lineFormula(r4, `="Срок поставки ЭКО-серия исчисляется с момента поступления предоплаты на р/счет и составляет: "&${termsInfo.cells.ecoLead}`);
-
-  lineValue(r5, 'Оборудование поставляется в упаковке в разобранном/частично собранном виде');
-  lineValue(r6, 'Срок поставки может быть изменен в случае изменения технического задания, либо при необходимости внесения изменений заказчиком в конструкцию изделий');
-
-  lineFormula(r7, `="Данное КП действительно в течение: "&${termsInfo.cells.validityDays}&" (семи) дней"`);
-
-  return r7 + 1;
-}
-
-/* ------------------- Форматы ------------------- */
-
-function applyGlobalFontSize_(sh, size) {
-  try {
-    const maxR = Math.max(sh.getMaxRows(), sh.getLastRow(), 1);
-    const maxC = Math.max(sh.getMaxColumns(), sh.getLastColumn(), 1);
-    sh.getRange(1, 1, maxR, Math.min(maxC, KP_CFG.COL_END)).setFontSize(size);
-  } catch (e) {}
-}
-
-function applyNumberFormats_(sh, firstDataRow, lastDataRow, totalsInfo) {
-  if (firstDataRow && lastDataRow && lastDataRow >= firstDataRow) {
-    const n = lastDataRow - firstDataRow + 1;
-
-    sh.getRange(firstDataRow, 6, n, 1).setNumberFormat(KP_CFG.NUM_FMT_MONEY); // F
-    sh.getRange(firstDataRow, 8, n, 1).setNumberFormat(KP_CFG.NUM_FMT_MONEY); // H
-    sh.getRange(firstDataRow, 9, n, 1).setNumberFormat(KP_CFG.NUM_FMT_MONEY); // I
-    sh.getRange(firstDataRow, 10, n, 1).setNumberFormat(KP_CFG.NUM_FMT_MONEY); // J
-    sh.getRange(firstDataRow, 11, n, 1).setNumberFormat(KP_CFG.NUM_FMT_MONEY); // K
-
-    sh.getRange(firstDataRow, 7, n, 1).setNumberFormat(KP_CFG.NUM_FMT_INT);   // G
-    sh.getRange(firstDataRow, 12, n, 1).setNumberFormat(KP_CFG.NUM_FMT_TEXT); // L
-    sh.getRange(firstDataRow, 13, n, 1).setNumberFormat(KP_CFG.NUM_FMT_PCT);  // M
-    sh.getRange(firstDataRow, 14, n, 1).setNumberFormat(KP_CFG.NUM_FMT_TEXT); // N (UID)
-  }
-
-  if (totalsInfo && totalsInfo.cells) {
-    try { sh.getRange(totalsInfo.cells.equipmentTotal).setNumberFormat(KP_CFG.NUM_FMT_MONEY); } catch (e) {}
-    try { sh.getRange(totalsInfo.cells.delivery).setNumberFormat(KP_CFG.NUM_FMT_MONEY); } catch (e) {}
-    try { sh.getRange(totalsInfo.cells.installTotal).setNumberFormat(KP_CFG.NUM_FMT_MONEY); } catch (e) {}
-    try { sh.getRange(totalsInfo.cells.toPay).setNumberFormat(KP_CFG.NUM_FMT_MONEY); } catch (e) {}
-    try { sh.getRange(totalsInfo.cells.vat).setNumberFormat(KP_CFG.NUM_FMT_MONEY); } catch (e) {}
-  }
 }
