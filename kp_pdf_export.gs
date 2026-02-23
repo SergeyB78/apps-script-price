@@ -14,14 +14,35 @@ function validateRequiredKpFields_(sh) {
   const requiredLabels = [
     'Наименование Заказчика',
     'Адрес Заказчика',
-    'Менеджер'
+    'Менеджер',
+    'Коммерческое предложение №',
+    'Дата КП',
   ];
 
   const missing = [];
+
+  // 1) Проверка обязательных полей (значение берём из колонки D по подписи)
   for (const label of requiredLabels) {
     const v = findValueByLabelInColD_(sh, label); // утилита из kp_utils.gs
     if (isEmptyValue_(v)) missing.push(label);
   }
+
+  // 2) Проверка корзины: должно быть > 0 позиций
+  // Используем существующую функцию, которая уже читает корзину КП. :contentReference[oaicite:1]{index=1}
+  const cartLabel = 'Количество позиций в корзине (> 0)';
+  try {
+    if (typeof extractCartAsJson_ === 'function') {
+      const cart = extractCartAsJson_(sh);
+      const cnt = (cart && Array.isArray(cart.items)) ? cart.items.length : 0;
+      if (cnt <= 0) missing.push(cartLabel);
+    } else {
+      // если вдруг кто-то удалил kp_log.gs / функцию — считаем, что корзина невалидна
+      missing.push(cartLabel);
+    }
+  } catch (e) {
+    missing.push(cartLabel);
+  }
+
   return missing;
 }
 

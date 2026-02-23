@@ -3,47 +3,25 @@
  *
  * ДОРАБОТКА:
  * 1) Расширенная проверка дублей ПЕРЕД формированием PDF и записью в журнал.
- *    Дубликат = совпадают:
- *      - КП №
- *      - Заказчик
- *      - Адрес заказчика
- *      - Итого к оплате, руб
- *      - Срок (Основное)
- *      - Срок (ЭКО)
- *      - КП действительно, дней
- *      - Примечания по позициям (из Позиции(JSON) берём только поле note/Примечание)
- *    (Полный JSON не сравниваем.)
- *
  * 2) Колонка "Скидка (-) / Наценка (+), %" в корзине НЕ должна попадать в PDF:
- *    перед экспортом временно скрываем колонку M (13) + пытаемся найти по заголовку ("скидка" и "%"),
- *    затем возвращаем обратно.
- *
- * Разделение ответственности:
- * - kp_pdf_export.gs: validateRequiredKpFields_, exportSheetToPdfBlob_, savePdfToDriveFolder_, showLinksDialog_,
- *                    findRowByExactText_, hideRowsBySortedList_, showRowsBySortedList_, rangeRows_, isRowBlank_
- * - kp_log.gs: extractMetaForLog_, extractCartAsJson_, buildPdfFileName_, buildLogRow_, appendToLog_
- * - kp_utils.gs: findValueByLabelInColD_, findTermsValueRight_, toNumber_, normalizePercent_, isFiniteNumber_
+ *    перед экспортом временно скрываем колонку M (13) + ищем по заголовку.
+ * 3) UID-колонка (N, 14) тоже НЕ должна попадать в PDF — скрываем аналогично.
  */
 
 const KP_EXPORT_CFG = {
   KP_SHEET: (typeof CFG !== 'undefined' && CFG.SHEETS && CFG.SHEETS.KP) ? CFG.SHEETS.KP : 'КП',
   LOG_SHEET: (typeof CFG !== 'undefined' && CFG.SHEETS && CFG.SHEETS.KP_LOG) ? CFG.SHEETS.KP_LOG : 'Журнал КП',
-
-  DRIVE_FOLDER_ID: (typeof CFG !== 'undefined' && CFG.IDS && CFG.IDS.DRIVE_FOLDER_ID)
-    ? CFG.IDS.DRIVE_FOLDER_ID
-    : '1o8lqVv3DlUe4e3bMpWKvNZncf5r_2xDD',
+  DRIVE_FOLDER_ID: (typeof CFG !== 'undefined' && CFG.IDS && CFG.IDS.DRIVE_FOLDER_ID) ? CFG.IDS.DRIVE_FOLDER_ID : '1o8lqVv3DlUe4e3bMpWKvNZncf5r_2xDD',
 
   EXCLUDE_BLOCK_TITLES: {
     SETTINGS: 'Настройки расчёта',
-    TERMS: 'Условия и сроки поставки (изменяемые)'
+    TERMS: 'Условия и сроки поставки (изменяемые)',
   },
-
   SETTINGS_ROWS_AFTER_TITLE: 3,
   TERMS_ROWS_AFTER_TITLE: 4,
 
   CART_HEADER: 'Артикул',
 
-  // Длина шапки журнала берётся из split версии (если у вас уже есть другое — не критично).
   LOG_HEADERS: [
     'Дата/время выгрузки',
     'КП №',
@@ -53,10 +31,8 @@ const KP_EXPORT_CFG = {
     'Заказчик',
     'Адрес заказчика',
     '№ договора',
-
     'Скидка (-) / Наценка (+), %',
     'Размер монтажа от стоимости оборудования, %',
-
     'Итого оборудование, руб',
     'Монтаж, руб',
     'Доставка, руб',
@@ -67,12 +43,11 @@ const KP_EXPORT_CFG = {
     'Срок (Основное)',
     'Срок (ЭКО)',
     'КП действительно, дней',
-
     'Позиции (JSON)',
     'PDF URL (Drive)',
     'PDF Download URL',
-    'Drive File ID'
-  ]
+    'Drive File ID',
+  ],
 };
 
 function exportKpPdfAndLog() {
@@ -91,7 +66,6 @@ function exportKpPdfAndLog() {
   // Считываем meta+cart ДО скрытий и ДО PDF (для дублей)
   const meta = extractMetaForLog_(sh);
   const cart = extractCartAsJson_(sh);
-
   const notesSig = notesSignatureFromCartJson_(cart && cart.jsonString ? cart.jsonString : '[]');
 
   const dup = findDuplicateInLogExt_(ss, meta, notesSig);
@@ -101,7 +75,7 @@ function exportKpPdfAndLog() {
   }
 
   const toHide = [];
-  let discountState = null;
+  let colsState = null;
 
   try {
     // исключаем блоки из PDF
@@ -122,8 +96,8 @@ function exportKpPdfAndLog() {
     const uniqueHide = Array.from(new Set(toHide)).filter(r => r >= 1 && r <= sh.getMaxRows());
     if (uniqueHide.length) hideRowsBySortedList_(sh, uniqueHide);
 
-    // скрываем колонку скидки в корзине
-    discountState = hideDiscountColumnForPdf_(sh);
+    // скрываем колонку скидки + UID в корзине
+    colsState = hideServiceColumnsForPdf_(sh);
 
     // PDF
     const pdfBlob = exportSheetToPdfBlob_(ss, sh, buildPdfFileName_(meta));
@@ -134,10 +108,8 @@ function exportKpPdfAndLog() {
     appendToLog_(ss, logRow);
 
     showLinksDialog_(saved.fileUrl, saved.downloadUrl);
-
   } finally {
-    try { if (discountState) restoreDiscountColumnAfterPdf_(sh, discountState); } catch (e) {}
-
+    try { if (colsState) restoreServiceColumnsAfterPdf_(sh, colsState); } catch (e) {}
     try {
       const uniqueHide = Array.from(new Set(toHide)).filter(r => r >= 1 && r <= sh.getMaxRows());
       if (uniqueHide.length) showRowsBySortedList_(sh, uniqueHide);
@@ -145,9 +117,7 @@ function exportKpPdfAndLog() {
   }
 }
 
-/* ==========================
-   Дубликаты: сравнение по условиям + ТОЛЬКО примечания
-   ========================== */
+/* ========================== Дубликаты: сравнение по условиям + ТОЛЬКО примечания ========================== */
 
 function findDuplicateInLogExt_(ss, meta, notesSig) {
   const log = ss.getSheetByName(KP_EXPORT_CFG.LOG_SHEET);
@@ -160,38 +130,37 @@ function findDuplicateInLogExt_(ss, meta, notesSig) {
   const hdr = log.getRange(1, 1, 1, lastCol).getDisplayValues()[0].map(_norm_);
   const col = (name) => hdr.indexOf(_norm_(name)) + 1;
 
-  const cKp    = col('КП №');
-  const cCust  = col('Заказчик');
-  const cAddr  = col('Адрес заказчика');
+  const cKp = col('КП №');
+  const cCust = col('Заказчик');
+  const cAddr = col('Адрес заказчика');
   const cToPay = col('Итого к оплате, руб');
-  const cMain  = col('Срок (Основное)');
-  const cEco   = col('Срок (ЭКО)');
+  const cMain = col('Срок (Основное)');
+  const cEco = col('Срок (ЭКО)');
   const cValid = col('КП действительно, дней');
-  const cJson  = col('Позиции (JSON)');
-  const cPdf   = col('PDF URL (Drive)');
+  const cJson = col('Позиции (JSON)');
+  const cPdf = col('PDF URL (Drive)');
 
   if (!cKp || !cCust || !cAddr || !cToPay || !cMain || !cEco || !cValid || !cJson) return { found: false };
 
   const n = lastRow - 1;
 
-  const kpVals   = log.getRange(2, cKp, n, 1).getDisplayValues().map(r => String(r[0]||'').trim());
-  const custVals = log.getRange(2, cCust, n, 1).getDisplayValues().map(r => String(r[0]||'').trim());
+  const kpVals = log.getRange(2, cKp, n, 1).getDisplayValues().map(r => String(r[0] || '').trim());
+  const custVals = log.getRange(2, cCust, n, 1).getDisplayValues().map(r => String(r[0] || '').trim());
   const addrVals = log.getRange(2, cAddr, n, 1).getDisplayValues().map(r => _normText_(r[0]));
   const mainVals = log.getRange(2, cMain, n, 1).getDisplayValues().map(r => _normText_(r[0]));
-  const ecoVals  = log.getRange(2, cEco, n, 1).getDisplayValues().map(r => _normText_(r[0]));
+  const ecoVals = log.getRange(2, cEco, n, 1).getDisplayValues().map(r => _normText_(r[0]));
   const validVals = log.getRange(2, cValid, n, 1).getValues().map(r => r[0]);
-  const payVals  = log.getRange(2, cToPay, n, 1).getValues().map(r => r[0]);
-  const jsonVals = log.getRange(2, cJson, n, 1).getDisplayValues().map(r => String(r[0]||'').trim());
-  const pdfVals  = cPdf ? log.getRange(2, cPdf, n, 1).getDisplayValues().map(r => String(r[0]||'').trim()) : [];
+  const payVals = log.getRange(2, cToPay, n, 1).getValues().map(r => r[0]);
+  const jsonVals = log.getRange(2, cJson, n, 1).getDisplayValues().map(r => String(r[0] || '').trim());
+  const pdfVals = cPdf ? log.getRange(2, cPdf, n, 1).getDisplayValues().map(r => String(r[0] || '').trim()) : [];
 
-  const keyKp    = String(meta.kpNo || '').trim();
-  const keyCust  = String(meta.customer || '').trim();
-  const keyAddr  = _normText_(meta.customerAddr || '');
-  const keyMain  = _normText_(meta.mainLead || '');
-  const keyEco   = _normText_(meta.ecoLead || '');
+  const keyKp = String(meta.kpNo || '').trim();
+  const keyCust = String(meta.customer || '').trim();
+  const keyAddr = _normText_(meta.customerAddr || '');
+  const keyMain = _normText_(meta.mainLead || '');
+  const keyEco = _normText_(meta.ecoLead || '');
   const keyValid = _round0_(_toNum_(meta.validDays));
-  const keyPay   = _round2_(_toNum_(meta.toPay));
-
+  const keyPay = _round2_(_toNum_(meta.toPay));
   const keyNotes = String(notesSig || '');
 
   for (let i = n - 1; i >= 0; i--) {
@@ -218,7 +187,7 @@ function findDuplicateInLogExt_(ss, meta, notesSig) {
       customer: keyCust,
       customerAddr: meta.customerAddr || '',
       toPay: keyPay,
-      pdfUrl: (pdfVals[i] || '')
+      pdfUrl: (pdfVals[i] || ''),
     };
   }
 
@@ -227,19 +196,19 @@ function findDuplicateInLogExt_(ss, meta, notesSig) {
 
 function showDuplicateDialogExt_(dup) {
   const url = dup.pdfUrl || '';
-  const html =
-    `<div style="font-family:Arial;font-size:13px;line-height:1.35;">
-       <p><b>Такое КП уже сформировано (совпали условия + примечания)</b></p>
-       <p>КП №: <b>${_esc_(dup.kpNo)}</b><br>
-          Заказчик: <b>${_esc_(dup.customer)}</b><br>
-          Адрес: <b>${_esc_(dup.customerAddr)}</b><br>
-          Итого к оплате: <b>${_esc_(String(dup.toPay))}</b></p>
-       <p>Запись в журнале: строка <b>${dup.row}</b></p>
-       ${url ? `<p><a href="${url}" target="_blank">Открыть PDF (Drive)</a></p>` : `<p>Ссылка на PDF в журнале не найдена.</p>`}
-       <p style="color:#666;">Новая выгрузка не выполнена, чтобы избежать дублирования.</p>
-     </div>`;
+  const html = `
+    Такое КП уже сформировано (совпали условия + примечания)
+    <br><br>
+    <b>КП №:</b> ${_esc_(dup.kpNo)}<br>
+    <b>Заказчик:</b> ${_esc_(dup.customer)}<br>
+    <b>Адрес:</b> ${_esc_(dup.customerAddr)}<br>
+    <b>Итого к оплате:</b> ${_esc_(String(dup.toPay))}<br><br>
+    <b>Запись в журнале:</b> строка ${dup.row}<br><br>
+    ${url ? `<a href="${url}" target="_blank">Открыть PDF (Drive)</a><br><br>` : 'Ссылка на PDF в журнале не найдена.<br><br>'}
+    Новая выгрузка не выполнена, чтобы избежать дублирования.
+  `;
   SpreadsheetApp.getUi().showModalDialog(
-    HtmlService.createHtmlOutput(html).setWidth(480).setHeight(290),
+    HtmlService.createHtmlOutput(html).setWidth(520).setHeight(310),
     'Дубликат КП'
   );
 }
@@ -247,19 +216,22 @@ function showDuplicateDialogExt_(dup) {
 /**
  * Вытаскиваем "сигнатуру примечаний" из JSON позиций:
  * берём пары art|note, нормализуем пробелы/регистр, сортируем по art.
+ * UID игнорируем (это нормально).
  */
 function notesSignatureFromCartJson_(jsonStr) {
   const raw = String(jsonStr || '').trim();
   if (!raw) return '';
+
   try {
     const arr = JSON.parse(raw);
     if (!Array.isArray(arr)) return '';
+
     const pairs = arr.map(it => {
       const art = String(it.art || '').trim();
-      // в JSON мы пишем note (из kp_log.gs); на всякий случай поддержим "Примечание"
       const note = String(it.note ?? it['Примечание'] ?? '').trim();
       return art + '|' + _normNote_(note);
     });
+
     pairs.sort();
     return pairs.join('\n');
   } catch (e) {
@@ -271,9 +243,8 @@ function _norm_(s) {
   return String(s || '').replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
 }
 function _normText_(s) { return _norm_(s); }
-function _normNote_(s) {
-  return String(s || '').replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
-}
+function _normNote_(s) { return String(s || '').replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase(); }
+
 function _toNum_(v) {
   if (v === null || v === undefined || v === '') return 0;
   if (typeof v === 'number') return v;
@@ -285,51 +256,62 @@ function _round2_(n) { return Math.round((Number(n) || 0) * 100) / 100; }
 function _round0_(n) { return Math.round(Number(n) || 0); }
 function _esc_(s) {
   return String(s || '')
-    .replace(/&/g,'&amp;')
-    .replace(/</g,'&lt;')
-    .replace(/>/g,'&gt;')
-    .replace(/"/g,'&quot;')
-    .replace(/'/g,'&#039;');
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
-/* ==========================
-   Скрытие колонки скидки в PDF
-   ========================== */
+/* ========================== Скрытие служебных колонок в PDF ========================== */
 
-function hideDiscountColumnForPdf_(sh) {
-  const state = { col: 0, wasHidden: false, extraCol: 0, extraWasHidden: false };
+function hideServiceColumnsForPdf_(sh) {
+  const state = { hidden: [] };
 
-  // 1) основной вариант — колонка M (13)
-  if (sh.getLastColumn() >= 13) {
-    try {
-      state.col = 13;
-      state.wasHidden = sh.isColumnHiddenByUser(13);
-      if (!state.wasHidden) sh.hideColumns(13);
-    } catch (e) {}
-  }
+  const hideCol = (col) => {
+    if (!col || col < 1 || col > sh.getLastColumn()) return;
+    const wasHidden = sh.isColumnHiddenByUser(col);
+    if (!wasHidden) sh.hideColumns(col);
+    state.hidden.push({ col, wasHidden });
+  };
 
-  // 2) поиск по заголовку в шапке корзины
+  // 1) фикс: скидка в M (13) — как было
+  hideCol(13);
+
+  // 2) фикс: UID в N (14) — новый
+  hideCol(14);
+
+  // 3) доп. поиск по заголовку корзины (если вдруг колонки переместятся)
   try {
     const headerRow = findCartHeaderRowByA_(sh, KP_EXPORT_CFG.CART_HEADER);
     if (headerRow) {
-      const col = findDiscountColInCartHeader_(sh, headerRow);
-      if (col && col !== state.col) {
-        state.extraCol = col;
-        state.extraWasHidden = sh.isColumnHiddenByUser(col);
-        if (!state.extraWasHidden) sh.hideColumns(col);
+      const maxCol = Math.min(60, sh.getLastColumn());
+      const hdrs = sh.getRange(headerRow, 1, 1, maxCol).getDisplayValues()[0].map(_norm_);
+
+      for (let c = 0; c < hdrs.length; c++) {
+        const t = hdrs[c];
+        if (!t) continue;
+        if (t.includes('скидка') && t.includes('%')) hideCol(c + 1);
+        if (t === 'uid') hideCol(c + 1);
       }
     }
   } catch (e) {}
 
   try { SpreadsheetApp.flush(); } catch (e) {}
-  try { Utilities.sleep(800); } catch (e) {}
+  try { Utilities.sleep(600); } catch (e) {}
 
   return state;
 }
 
-function restoreDiscountColumnAfterPdf_(sh, state) {
-  try { if (state && state.col && !state.wasHidden) sh.showColumns(state.col); } catch (e) {}
-  try { if (state && state.extraCol && !state.extraWasHidden) sh.showColumns(state.extraCol); } catch (e) {}
+function restoreServiceColumnsAfterPdf_(sh, state) {
+  if (!state || !state.hidden) return;
+
+  for (const it of state.hidden) {
+    try {
+      if (it && it.col && !it.wasHidden) sh.showColumns(it.col);
+    } catch (e) {}
+  }
+
   try { SpreadsheetApp.flush(); } catch (e) {}
 }
 
@@ -339,17 +321,6 @@ function findCartHeaderRowByA_(sh, anchorText) {
   for (let r = 1; r <= last; r++) {
     const v = _norm_(sh.getRange(r, 1).getDisplayValue());
     if (v === anchor) return r;
-  }
-  return 0;
-}
-
-function findDiscountColInCartHeader_(sh, headerRow) {
-  const maxCol = Math.min(40, sh.getLastColumn());
-  const hdrs = sh.getRange(headerRow, 1, 1, maxCol).getDisplayValues()[0].map(_norm_);
-  for (let c = 0; c < hdrs.length; c++) {
-    const t = hdrs[c];
-    if (!t) continue;
-    if (t.includes('скидка') && t.includes('%')) return c + 1;
   }
   return 0;
 }

@@ -3,10 +3,15 @@
  * Поведение сохранено как в исходной версии:
  * - пересоздаём лист "Прайс" (удаляем и создаём заново)
  * - перемещаем "Прайс" на 2-е место
- * - группирующие строки "Тип / Серия" в колонке B, merge B:I
+ * - группирующие строки "Тип / Серия" в колонке B
  * - outline (+/-) и сворачиваем группы
  * - UID скрываем
  * - копируем ширины колонок и форматы из БД
+ *
+ * ДОРАБОТКА (по задаче):
+ * - На строке каждой группы в колонке "Кол-во" показываем сумму выбранных количеств в группе
+ * - Дополнительную колонку НЕ добавляем:
+ *   поэтому строку группы теперь мерджим B:H (а колонку I оставляем под сумму).
  *
  * onOpen() находится в main.gs (НЕ трогаем).
  */
@@ -28,17 +33,15 @@ const PRICE = {
   COL_NOTE: () => CFG.DB_HEADERS.NOTE,
   COL_STATUS: () => CFG.DB_HEADERS.STATUS,
 
-  ICON: "🖼️",
+  ICON: "️🖼️",
 };
 
 /**
- * ВАЖНО: оставляем это имя, потому что у вас оно где-то уже используется
- * (меню/кнопка/назначенный скрипт).
+ * ВАЖНО: оставляем это имя, потому что у вас оно где-то уже используется (меню/кнопка/назначенный скрипт).
  */
 function buildPriceSheetWithOutlines() {
   const lock = LockService.getDocumentLock();
   if (!lock.tryLock(30000)) return;
-
   try {
     buildPrice_();
   } finally {
@@ -63,10 +66,19 @@ function buildPrice_() {
   const idx = makeIndex_(header);
 
   const required = [
-    PRICE.COL_UID(), PRICE.COL_TYPE(), PRICE.COL_SERIES(), PRICE.COL_ART(),
-    PRICE.COL_VIEW1(), PRICE.COL_VIEW2(), PRICE.COL_NAME(), PRICE.COL_UNIT(),
-    PRICE.COL_PRICE(), PRICE.COL_NOTE(), PRICE.COL_STATUS()
+    PRICE.COL_UID(),
+    PRICE.COL_TYPE(),
+    PRICE.COL_SERIES(),
+    PRICE.COL_ART(),
+    PRICE.COL_VIEW1(),
+    PRICE.COL_VIEW2(),
+    PRICE.COL_NAME(),
+    PRICE.COL_UNIT(),
+    PRICE.COL_PRICE(),
+    PRICE.COL_NOTE(),
+    PRICE.COL_STATUS()
   ];
+
   for (const c of required) {
     if (idx[c] === undefined) {
       throw new Error(`На листе "${PRICE.SOURCE_SHEET()}" не найдена обязательная колонка: "${c}".`);
@@ -77,6 +89,7 @@ function buildPrice_() {
   const view1RT = src.getRange(2, idx[PRICE.COL_VIEW1()] + 1, lastRow - 1, 1).getRichTextValues();
   const view2RT = src.getRange(2, idx[PRICE.COL_VIEW2()] + 1, lastRow - 1, 1).getRichTextValues();
 
+  // 1) Собираем активные позиции
   const items = [];
   for (let r = 1; r < values.length; r++) {
     const row = values[r];
@@ -94,7 +107,10 @@ function buildPrice_() {
     const v2Url = extractUrl_(view2RT[r - 1]?.[0], row[idx[PRICE.COL_VIEW2()]]);
 
     items.push({
-      uid, type, series, hasSeries,
+      uid,
+      type,
+      series,
+      hasSeries,
       art: String(row[idx[PRICE.COL_ART()]] || "").trim(),
       view1Url: v1Url,
       view2Url: v2Url,
@@ -105,6 +121,7 @@ function buildPrice_() {
     });
   }
 
+  // 2) Сортировка
   items.sort((a, b) => {
     const t = a.type.localeCompare(b.type, "ru");
     if (t) return t;
@@ -114,7 +131,7 @@ function buildPrice_() {
     return a.art.localeCompare(b.art, "ru");
   });
 
-  // пересоздаём лист "Прайс"
+  // 3) Пересоздаём лист "Прайс"
   let sh = ss.getSheetByName(PRICE.PRICE_SHEET());
   if (!sh) {
     sh = ss.insertSheet(PRICE.PRICE_SHEET());
@@ -129,7 +146,7 @@ function buildPrice_() {
   try { ss.moveActiveSheet(2); } catch (e) {}
   ss.setActiveSheet(sh);
 
-  // Шапка прайса (без колонок Вид оборудования/Серия)
+  // 4) Шапка прайса (без колонок Вид оборудования/Серия)
   const outHeader = [[
     "UID",
     "Артикул",
@@ -145,9 +162,9 @@ function buildPrice_() {
   sh.getRange(1, 1, 1, outHeader[0].length).setValues(outHeader);
   sh.setFrozenRows(1);
 
-  // Данные + блоки
+  // 5) Данные + блоки-группы
   const out = [];
-  const rowMeta = [];
+  const rowMeta = []; // {isGroup:boolean, itemIndex?:number}
   let prevKey = null;
 
   for (let i = 0; i < items.length; i++) {
@@ -156,18 +173,22 @@ function buildPrice_() {
     const key = `${it.type} / ${seriesLabel}`;
 
     if (key !== prevKey) {
+      // строка-группа
       out.push(["", key, "", "", "", "", "", "", ""]);
       rowMeta.push({ isGroup: true });
       prevKey = key;
     }
 
+    // строка-товар
     out.push([it.uid, it.art, "", "", it.name, it.unit, it.price, it.note, ""]);
     rowMeta.push({ isGroup: false, itemIndex: i });
   }
 
-  if (out.length) sh.getRange(2, 1, out.length, outHeader[0].length).setValues(out);
+  if (out.length) {
+    sh.getRange(2, 1, out.length, outHeader[0].length).setValues(out);
+  }
 
-  // Маппинг БД -> Прайс (форматы + ширины)
+  // 6) Маппинг БД -> Прайс (форматы + ширины)
   const mapCols = [
     { srcCol: idx[PRICE.COL_UID()] + 1,   dstCol: 1 }, // UID
     { srcCol: idx[PRICE.COL_ART()] + 1,   dstCol: 2 }, // Артикул
@@ -183,7 +204,8 @@ function buildPrice_() {
   for (const m of mapCols) {
     sh.setColumnWidth(m.dstCol, src.getColumnWidth(m.srcCol));
   }
-  sh.setColumnWidth(9, src.getColumnWidth(idx[PRICE.COL_UNIT()] + 1)); // Кол-во
+  // Кол-во — берём ширину от Ед. изм. (как было)
+  sh.setColumnWidth(9, src.getColumnWidth(idx[PRICE.COL_UNIT()] + 1));
 
   // форматы (шапка + строка 2 как шаблон)
   const dataRows = out.length;
@@ -195,12 +217,14 @@ function buildPrice_() {
         false
       );
     }
+    // формат заголовка кол-во
     src.getRange(1, idx[PRICE.COL_NOTE()] + 1, 1, 1).copyTo(
       sh.getRange(1, 9, 1, 1),
       SpreadsheetApp.CopyPasteType.PASTE_FORMAT,
       false
     );
 
+    // формат тела данных
     for (const m of mapCols) {
       src.getRange(2, m.srcCol, 1, 1).copyTo(
         sh.getRange(2, m.dstCol, dataRows, 1),
@@ -208,13 +232,18 @@ function buildPrice_() {
         false
       );
     }
-    sh.getRange(2, 9, dataRows, 1).setNumberFormat("0.##").setHorizontalAlignment("center");
+
+    // Кол-во: формат + выравнивание
+    sh.getRange(2, 9, dataRows, 1)
+      .setNumberFormat("0.##")
+      .setHorizontalAlignment("center");
   }
 
-  // 🖼️ иконки-ссылки
+  // 7) Иконки-ссылки в Вид 1 / Вид 2
   if (dataRows > 0) {
     const rt1 = [];
     const rt2 = [];
+
     for (let r = 0; r < rowMeta.length; r++) {
       const m = rowMeta[r];
       if (m.isGroup) {
@@ -226,33 +255,59 @@ function buildPrice_() {
         rt2.push([makeIconLink_(it.view2Url)]);
       }
     }
+
     sh.getRange(2, 3, dataRows, 1).setRichTextValues(rt1);
     sh.getRange(2, 4, dataRows, 1).setRichTextValues(rt2);
   }
 
-  // блок-строки: merge B:I + стиль
-  const startRow = 2;
+  // 8) Строки-группы: merge B:H (НЕ B:I) + стиль
+  const startRow = 2; // первая строка данных
   const groupRows = [];
-  for (let i = 0; i < rowMeta.length; i++) if (rowMeta[i].isGroup) groupRows.push(startRow + i);
+  for (let i = 0; i < rowMeta.length; i++) {
+    if (rowMeta[i].isGroup) groupRows.push(startRow + i);
+  }
 
   if (groupRows.length) {
-    for (const rr of groupRows) sh.getRange(rr, 2, 1, 8).merge(); // B..I
-    sh.getRangeList(groupRows.map(rr => `B${rr}:I${rr}`))
+    // merge B:H и стиль на B:H
+    for (const rr of groupRows) {
+      sh.getRange(rr, 2, 1, 7).merge(); // B..H (2..8)
+    }
+
+    sh.getRangeList(groupRows.map(rr => `B${rr}:H${rr}`))
       .setFontWeight("bold")
       .setBackground("#EDEDED")
       .setHorizontalAlignment("left")
       .setBorder(true, true, true, true, false, false);
+
+    // стиль на I (Кол-во) для строк группы
+    sh.getRangeList(groupRows.map(rr => `I${rr}`))
+      .setFontWeight("bold")
+      .setBackground("#EDEDED")
+      .setHorizontalAlignment("center")
+      .setBorder(true, true, true, true, false, false);
   }
 
-  // outline (+/-) и сразу свернуть
+  // 9) ДОРАБОТКА: на строке группы в I ставим сумму Кол-во по товарам этой группы
+  // Суммируем только строки, где UID (A) не пустой (то есть только товары).
+  if (dataRows > 0) {
+    applyGroupQtySumFormulas_(sh, rowMeta, startRow);
+  }
+
+  // 10) Outline (+/-) и сразу свернуть (как было)
   if (dataRows > 0) {
     let cursor = 0;
     while (cursor < rowMeta.length) {
-      if (!rowMeta[cursor].isGroup) { cursor++; continue; }
+      if (!rowMeta[cursor].isGroup) {
+        cursor++;
+        continue;
+      }
 
       const startItemsIdx = cursor + 1;
       if (startItemsIdx >= rowMeta.length) break;
-      if (rowMeta[startItemsIdx].isGroup) { cursor++; continue; }
+      if (rowMeta[startItemsIdx].isGroup) {
+        cursor++;
+        continue;
+      }
 
       let endItemsIdx = startItemsIdx;
       while (endItemsIdx + 1 < rowMeta.length && !rowMeta[endItemsIdx + 1].isGroup) endItemsIdx++;
@@ -261,6 +316,7 @@ function buildPrice_() {
       const numRows = endItemsIdx - startItemsIdx + 1;
 
       sh.getRange(startItemsRow, 1, numRows, 1).shiftRowGroupDepth(1);
+
       try {
         const rg = sh.getRowGroup(startItemsRow, 1);
         if (rg) rg.collapse();
@@ -270,15 +326,56 @@ function buildPrice_() {
     }
   }
 
-  // UID скрыть
+  // 11) UID скрыть
   sh.hideColumn(sh.getRange("A:A"));
-
   ss.setActiveSheet(sh);
+}
+
+/**
+ * Ставит формулы суммы в колонку I на строках групп.
+ * rowMeta индексируется по "данным" начиная со startRow.
+ */
+function applyGroupQtySumFormulas_(sh, rowMeta, startRow) {
+  let cursor = 0;
+
+  while (cursor < rowMeta.length) {
+    if (!rowMeta[cursor].isGroup) {
+      cursor++;
+      continue;
+    }
+
+    const startItemsIdx = cursor + 1;
+    if (startItemsIdx >= rowMeta.length) break;
+    if (rowMeta[startItemsIdx].isGroup) {
+      cursor++;
+      continue;
+    }
+
+    let endItemsIdx = startItemsIdx;
+    while (endItemsIdx + 1 < rowMeta.length && !rowMeta[endItemsIdx + 1].isGroup) endItemsIdx++;
+
+    const groupRow = startRow + cursor;
+    const itemsRow1 = startRow + startItemsIdx;
+    const itemsRow2 = startRow + endItemsIdx;
+
+    // Колонка A = UID, колонка I = Кол-во
+    const formula = `=SUMIF($A${itemsRow1}:$A${itemsRow2};"<>";$I${itemsRow1}:$I${itemsRow2})`;
+
+    sh.getRange(groupRow, 9)
+      .setFormula(formula)
+      .setNumberFormat("0.##")
+      .setHorizontalAlignment("center")
+      .setFontWeight("bold");
+
+    cursor = endItemsIdx + 1;
+  }
 }
 
 function makeIndex_(hdr) {
   const m = {};
-  hdr.forEach((h, i) => { if (h) m[h] = i; });
+  hdr.forEach((h, i) => {
+    if (h) m[h] = i;
+  });
   return m;
 }
 
@@ -306,5 +403,9 @@ function extractUrl_(rich, fallbackCellValue) {
 function makeIconLink_(url) {
   const u = String(url || "").trim();
   if (!u) return SpreadsheetApp.newRichTextValue().setText("").build();
-  return SpreadsheetApp.newRichTextValue().setText(PRICE.ICON).setLinkUrl(u).build();
+
+  return SpreadsheetApp.newRichTextValue()
+    .setText(PRICE.ICON)
+    .setLinkUrl(u)
+    .build();
 }
