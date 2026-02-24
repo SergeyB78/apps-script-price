@@ -1,287 +1,15 @@
 /**
- * КП pdf.gs (контроллер)
+ * kp_log.gs — сбор данных для журнала КП и запись в лист "Журнал КП"
  *
- * ДОРАБОТКА:
- * 1) Расширенная проверка дублей ПЕРЕД формированием PDF и записью в журнал.
- *    Дубликат = совпадают:
- *    - КП №
- *    - Заказчик
- *    - Адрес заказчика
- *    - Итого к оплате, руб
- *    - Срок (Основное)
- *    - Срок (ЭКО)
- *    - КП действительно, дней
- *    - Примечания по позициям (из Позиции(JSON) берём только поле note/Примечание)
- *      (Полный JSON не сравниваем.)
- *
- * 2) Колонка "Скидка (-) / Наценка (+), %" в корзине НЕ должна попадать в PDF:
- *    перед экспортом временно скрываем колонку M (13) + пытаемся найти по заголовку ("скидка" и "%"),
- *    затем возвращаем обратно.
- *
- * Разделение ответственности:
- * - kp_pdf_export.gs: validateRequiredKpFields_, exportSheetToPdfBlob_, savePdfToDriveFolder_, showLinksDialog_,
- *   findRowByExactText_, hideRowsBySortedList_, showRowsBySortedList_, rangeRows_, isRowBlank_
- * - kp_log.gs: extractMetaForLog_, extractCartAsJson_, buildPdfFileName_, buildLogRow_, appendToLog_
- * - kp_utils.gs: findValueByLabelInColD_, findTermsValueRight_, toNumber_, normalizePercent_, isFiniteNumber_
+ * Основное:
+ * - appendToLog_() пишет ПО ЗАГОЛОВКАМ, а не "слева направо"
+ * - ensureKpLogSchema_() гарантирует наличие колонки "Статус"
+ * - Для новых записей статус = "Новая" + выпадающий список
  */
 
-const KP_EXPORT_CFG = {
-  KP_SHEET:
-    (typeof CFG !== 'undefined' && CFG.SHEETS && CFG.SHEETS.KP)
-      ? CFG.SHEETS.KP
-      : 'КП',
+/* ========================= Helpers / Safe wrappers ========================= */
 
-  // ✅ Имя журнала берём из единой схемы (settings.gs)
-  LOG_SHEET:
-    (typeof getSheetSchemaName_ === 'function')
-      ? getSheetSchemaName_('KP_LOG')
-      : ((typeof CFG !== 'undefined' && CFG.SHEETS && CFG.SHEETS.KP_LOG)
-          ? CFG.SHEETS.KP_LOG
-          : 'Журнал КП'),
-
-  DRIVE_FOLDER_ID:
-    (typeof CFG !== 'undefined' && CFG.IDS && CFG.IDS.DRIVE_FOLDER_ID)
-      ? CFG.IDS.DRIVE_FOLDER_ID
-      : '1o8lqVv3DlUe4e3bMpWKvNZncf5r_2xDD',
-
-  EXCLUDE_BLOCK_TITLES: {
-    SETTINGS: 'Настройки расчёта',
-    TERMS: 'Условия и сроки поставки (изменяемые)'
-  },
-
-  SETTINGS_ROWS_AFTER_TITLE: 3,
-  TERMS_ROWS_AFTER_TITLE: 4,
-  CART_HEADER: 'Артикул',
-
-  // ✅ Шапка журнала КП — только из единой схемы (settings.gs)
-  // appendToLog_() в kp_log.gs использует именно KP_EXPORT_CFG.LOG_HEADERS при автосоздании листа
-  LOG_HEADERS:
-    (typeof getSheetSchemaHeaders_ === 'function')
-      ? getSheetSchemaHeaders_('KP_LOG')
-      : []
-};
-
-function exportKpPdfAndLog() {
-  const ss = SpreadsheetApp.getActive();
-  const sh = ss.getSheetByName(KP_EXPORT_CFG.KP_SHEET);
-  if (!sh) throw new Error('Не найден лист "КП".');
-
-  const missing = validateRequiredKpFields_(sh);
-  if (missing && missing.length) {
-    SpreadsheetApp.getUi().alert(
-      'Экспорт КП невозможен.\n\nНе заполнены обязательные поля:\n- ' + missing.join('\n- ')
-    );
-    return;
-  }
-
-  // Считываем meta+cart ДО скрытий и ДО PDF (для дублей)
-  const meta = extractMetaForLog_(sh);
-  const cart = extractCartAsJson_(sh);
-  const notesSig = notesSignatureFromCartJson_(cart && cart.jsonString ? cart.jsonString : '[]');
-
-  const dup = findDuplicateInLogExt_(ss, meta, notesSig);
-  if (dup && dup.found) {
-    showDuplicateDialogExt_(dup);
-    return;
-  }
-
-  const toHide = [];
-  let discountState = null;
-
-  try {
-    // исключаем блоки из PDF
-    const rSettings = findRowByExactText_(sh, KP_EXPORT_CFG.EXCLUDE_BLOCK_TITLES.SETTINGS);
-    if (rSettings) {
-      const rPrev = rSettings - 1;
-      if (rPrev >= 1 && isRowBlank_(sh, rPrev)) toHide.push(rPrev);
-
-      toHide.push(rSettings);
-      toHide.push(
-        ...rangeRows_(rSettings + 1, rSettings + KP_EXPORT_CFG.SETTINGS_ROWS_AFTER_TITLE)
-      );
-    }
-
-    const rTerms = findRowByExactText_(sh, KP_EXPORT_CFG.EXCLUDE_BLOCK_TITLES.TERMS);
-    if (rTerms) {
-      toHide.push(rTerms);
-      toHide.push(
-        ...rangeRows_(rTerms + 1, rTerms + KP_EXPORT_CFG.TERMS_ROWS_AFTER_TITLE)
-      );
-    }
-
-    const uniqueHide = Array.from(new Set(toHide))
-      .filter(r => r >= 1 && r <= sh.getMaxRows());
-
-    if (uniqueHide.length) hideRowsBySortedList_(sh, uniqueHide);
-
-    // скрываем колонку скидки в корзине
-    discountState = hideDiscountColumnForPdf_(sh);
-
-    // PDF
-    const pdfBlob = exportSheetToPdfBlob_(ss, sh, buildPdfFileName_(meta));
-    const saved = savePdfToDriveFolder_(pdfBlob, KP_EXPORT_CFG.DRIVE_FOLDER_ID);
-
-    // log
-    const logRow = buildLogRow_(meta, cart.jsonString, saved.fileUrl, saved.downloadUrl, saved.fileId);
-    appendToLog_(ss, logRow);
-
-    showLinksDialog_(saved.fileUrl, saved.downloadUrl);
-
-  } finally {
-    try {
-      if (discountState) restoreDiscountColumnAfterPdf_(sh, discountState);
-    } catch (e) {}
-
-    try {
-      const uniqueHide = Array.from(new Set(toHide))
-        .filter(r => r >= 1 && r <= sh.getMaxRows());
-      if (uniqueHide.length) showRowsBySortedList_(sh, uniqueHide);
-    } catch (e) {}
-  }
-}
-
-/* ==========================
- * Дубликаты: сравнение по условиям + ТОЛЬКО примечания
- * ========================== */
-
-function findDuplicateInLogExt_(ss, meta, notesSig) {
-  const log = ss.getSheetByName(KP_EXPORT_CFG.LOG_SHEET);
-  if (!log) return { found: false };
-
-  const lastRow = log.getLastRow();
-  const lastCol = log.getLastColumn();
-  if (lastRow < 2 || lastCol < 1) return { found: false };
-
-  const hdr = log.getRange(1, 1, 1, lastCol).getDisplayValues()[0].map(_norm_);
-  const col = (name) => hdr.indexOf(_norm_(name)) + 1;
-
-  const cKp = col('КП №');
-  const cCust = col('Заказчик');
-  const cAddr = col('Адрес заказчика');
-  const cToPay = col('Итого к оплате, руб');
-  const cMain = col('Срок (Основное)');
-  const cEco = col('Срок (ЭКО)');
-  const cValid = col('КП действительно, дней');
-  const cJson = col('Позиции (JSON)');
-  const cPdf = col('PDF URL (Drive)');
-
-  if (!cKp || !cCust || !cAddr || !cToPay || !cMain || !cEco || !cValid || !cJson) {
-    return { found: false };
-  }
-
-  const n = lastRow - 1;
-
-  const kpVals = log.getRange(2, cKp, n, 1).getDisplayValues().map(r => String(r[0] || '').trim());
-  const custVals = log.getRange(2, cCust, n, 1).getDisplayValues().map(r => String(r[0] || '').trim());
-  const addrVals = log.getRange(2, cAddr, n, 1).getDisplayValues().map(r => _normText_(r[0]));
-  const mainVals = log.getRange(2, cMain, n, 1).getDisplayValues().map(r => _normText_(r[0]));
-  const ecoVals = log.getRange(2, cEco, n, 1).getDisplayValues().map(r => _normText_(r[0]));
-  const validVals = log.getRange(2, cValid, n, 1).getValues().map(r => r[0]);
-  const payVals = log.getRange(2, cToPay, n, 1).getValues().map(r => r[0]);
-  const jsonVals = log.getRange(2, cJson, n, 1).getDisplayValues().map(r => String(r[0] || '').trim());
-  const pdfVals = cPdf
-    ? log.getRange(2, cPdf, n, 1).getDisplayValues().map(r => String(r[0] || '').trim())
-    : [];
-
-  const keyKp = String(meta.kpNo || '').trim();
-  const keyCust = String(meta.customer || '').trim();
-  const keyAddr = _normText_(meta.customerAddr || '');
-  const keyMain = _normText_(meta.mainLead || '');
-  const keyEco = _normText_(meta.ecoLead || '');
-  const keyValid = _round0_(_toNum_(meta.validDays));
-  const keyPay = _round2_(_toNum_(meta.toPay));
-  const keyNotes = String(notesSig || '');
-
-  for (let i = n - 1; i >= 0; i--) {
-    if (String(kpVals[i] || '').trim() !== keyKp) continue;
-    if (String(custVals[i] || '').trim() !== keyCust) continue;
-    if (addrVals[i] !== keyAddr) continue;
-    if (mainVals[i] !== keyMain) continue;
-    if (ecoVals[i] !== keyEco) continue;
-
-    const vValid = _round0_(_toNum_(validVals[i]));
-    if (vValid !== keyValid) continue;
-
-    const vPay = _round2_(_toNum_(payVals[i]));
-    if (Math.abs(vPay - keyPay) > 0.01) continue;
-
-    // Сравниваем только примечания (из JSON)
-    const vNotes = notesSignatureFromCartJson_(jsonVals[i]);
-    if (vNotes !== keyNotes) continue;
-
-    return {
-      found: true,
-      row: i + 2,
-      kpNo: keyKp,
-      customer: keyCust,
-      customerAddr: meta.customerAddr || '',
-      toPay: keyPay,
-      pdfUrl: (pdfVals[i] || '')
-    };
-  }
-
-  return { found: false };
-}
-
-function showDuplicateDialogExt_(dup) {
-  const url = dup.pdfUrl || '';
-  const html = `
-    <div style="font-family:Arial,sans-serif;font-size:13px;line-height:1.45;padding:8px;">
-      <div style="font-weight:700;color:#b00020;margin-bottom:8px;">
-        Такое КП уже сформировано (совпали условия + примечания)
-      </div>
-
-      <div><b>КП №:</b> ${_esc_(dup.kpNo)}</div>
-      <div><b>Заказчик:</b> ${_esc_(dup.customer)}</div>
-      <div><b>Адрес:</b> ${_esc_(dup.customerAddr)}</div>
-      <div><b>Итого к оплате:</b> ${_esc_(String(dup.toPay))}</div>
-      <div style="margin-top:6px;"><b>Запись в журнале:</b> строка ${dup.row}</div>
-
-      <div style="margin-top:10px;">
-        ${url
-          ? `<a href="${url}" target="_blank">Открыть PDF (Drive)</a>`
-          : `Ссылка на PDF в журнале не найдена.`}
-      </div>
-
-      <div style="margin-top:12px;color:#555;">
-        Новая выгрузка не выполнена, чтобы избежать дублирования.
-      </div>
-    </div>
-  `;
-
-  SpreadsheetApp.getUi().showModalDialog(
-    HtmlService.createHtmlOutput(html).setWidth(480).setHeight(290),
-    'Дубликат КП'
-  );
-}
-
-/**
- * Вытаскиваем "сигнатуру примечаний" из JSON позиций:
- * берём пары art|note, нормализуем пробелы/регистр, сортируем по art.
- */
-function notesSignatureFromCartJson_(jsonStr) {
-  const raw = String(jsonStr || '').trim();
-  if (!raw) return '';
-
-  try {
-    const arr = JSON.parse(raw);
-    if (!Array.isArray(arr)) return '';
-
-    const pairs = arr.map(it => {
-      const art = String((it && it.art) || '').trim();
-      // в JSON мы пишем note (из kp_log.gs); на всякий случай поддержим "Примечание"
-      const note = String((it && (it.note ?? it['Примечание'])) ?? '').trim();
-      return art + '|' + _normNote_(note);
-    });
-
-    pairs.sort();
-    return pairs.join('\n');
-  } catch (e) {
-    return '';
-  }
-}
-
-function _norm_(s) {
+function _normHeader_(s) {
   return String(s || '')
     .replace(/\n+/g, ' ')
     .replace(/\s+/g, ' ')
@@ -289,115 +17,433 @@ function _norm_(s) {
     .toLowerCase();
 }
 
-function _normText_(s) {
-  return _norm_(s);
-}
-
-function _normNote_(s) {
-  return String(s || '')
-    .replace(/\n+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .toLowerCase();
-}
-
-function _toNum_(v) {
+function _toNumberLoose_(v) {
+  if (typeof toNumber_ === 'function') return toNumber_(v);
   if (v === null || v === undefined || v === '') return 0;
-  if (typeof v === 'number') return v;
-
+  if (typeof v === 'number') return isFinite(v) ? v : 0;
   const s = String(v).replace(/\s+/g, '').replace(',', '.');
   const n = Number(s);
   return isNaN(n) ? 0 : n;
 }
 
-function _round2_(n) {
-  return Math.round((Number(n) || 0) * 100) / 100;
+function _normalizePercentLoose_(v) {
+  if (typeof normalizePercent_ === 'function') return normalizePercent_(v);
+  const n = _toNumberLoose_(v);
+  if (!n) return 0;
+  return n > 1 ? n / 100 : n;
 }
 
-function _round0_(n) {
-  return Math.round(Number(n) || 0);
+function _safeFindValueByLabelInColD_(sh, label) {
+  if (typeof findValueByLabelInColD_ === 'function') return findValueByLabelInColD_(sh, label);
+
+  // fallback: ищем подпись в A, значение в D
+  const maxScan = Math.min(400, sh.getLastRow());
+  for (let r = 1; r <= maxScan; r++) {
+    const a = String(sh.getRange(r, 1).getDisplayValue() || '').trim();
+    if (a === label) return sh.getRange(r, 4).getValue();
+  }
+  return '';
 }
 
-function _esc_(s) {
-  return String(s || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
+function _safeFindTermsValueRight_(sh, label) {
+  if (typeof findTermsValueRight_ === 'function') return findTermsValueRight_(sh, label);
+
+  // fallback: ищем подпись в A, значение в J
+  const maxScan = Math.min(700, sh.getLastRow());
+  for (let r = 1; r <= maxScan; r++) {
+    const a = String(sh.getRange(r, 1).getDisplayValue() || '').trim();
+    if (a === label) return sh.getRange(r, 10).getValue(); // J
+  }
+  return '';
 }
 
-/* ==========================
- * Скрытие колонки скидки в PDF
- * ========================== */
+function _findCartHeaderRow_(sh, anchorText) {
+  const needle = _normHeader_(anchorText || 'Артикул');
+  const last = Math.min(800, sh.getLastRow());
+  for (let r = 1; r <= last; r++) {
+    const v = _normHeader_(sh.getRange(r, 1).getDisplayValue());
+    if (v === needle) return r;
+  }
+  return 0;
+}
 
-function hideDiscountColumnForPdf_(sh) {
-  const state = {
-    col: 0,
-    wasHidden: false,
-    extraCol: 0,
-    extraWasHidden: false
-  };
+function _colByName_(hdrNorm, names) {
+  const variants = (names || []).map(_normHeader_);
+  for (let i = 0; i < hdrNorm.length; i++) {
+    if (variants.indexOf(hdrNorm[i]) >= 0) return i + 1;
+  }
+  return 0;
+}
 
-  // 1) основной вариант — колонка M (13)
-  if (sh.getLastColumn() >= 13) {
-    try {
-      state.col = 13;
-      state.wasHidden = sh.isColumnHiddenByUser(13);
-      if (!state.wasHidden) sh.hideColumns(13);
-    } catch (e) {}
+function _colByContainsAll_(hdrNorm, parts) {
+  const p = (parts || []).map(_normHeader_);
+  for (let i = 0; i < hdrNorm.length; i++) {
+    const t = hdrNorm[i] || '';
+    if (p.every(x => t.indexOf(x) >= 0)) return i + 1;
+  }
+  return 0;
+}
+
+function _kpLogSheetName_() {
+  return (typeof CFG !== 'undefined' && CFG.SHEETS && CFG.SHEETS.KP_LOG) ? CFG.SHEETS.KP_LOG : 'Журнал КП';
+}
+
+function _getKpLogHeadersCfg_() {
+  // Приоритет: CFG.SCHEMAS.KP_LOG
+  if (typeof CFG !== 'undefined' && CFG.SCHEMAS && Array.isArray(CFG.SCHEMAS.KP_LOG) && CFG.SCHEMAS.KP_LOG.length) {
+    return CFG.SCHEMAS.KP_LOG.slice();
   }
 
-  // 2) поиск по заголовку в шапке корзины
-  try {
-    const headerRow = findCartHeaderRowByA_(sh, KP_EXPORT_CFG.CART_HEADER);
-    if (headerRow) {
-      const col = findDiscountColInCartHeader_(sh, headerRow);
-      if (col && col !== state.col) {
-        state.extraCol = col;
-        state.extraWasHidden = sh.isColumnHiddenByUser(col);
-        if (!state.extraWasHidden) sh.hideColumns(col);
+  // fallback на старый KP_EXPORT_CFG.LOG_HEADERS
+  let headers = [];
+  if (typeof CFG !== 'undefined' && CFG.KP_EXPORT && Array.isArray(CFG.KP_EXPORT.LOG_HEADERS)) {
+    headers = CFG.KP_EXPORT.LOG_HEADERS.slice();
+  } else if (typeof KP_EXPORT_CFG !== 'undefined' && Array.isArray(KP_EXPORT_CFG.LOG_HEADERS)) {
+    headers = KP_EXPORT_CFG.LOG_HEADERS.slice();
+  }
+
+  // гарантируем Статус
+  if (headers.indexOf('Статус') < 0) headers.push('Статус');
+  return headers;
+}
+
+function _getKpStatusList_() {
+  if (typeof CFG !== 'undefined' && CFG.DROPDOWNS && Array.isArray(CFG.DROPDOWNS.KP_LOG_STATUS)) {
+    return CFG.DROPDOWNS.KP_LOG_STATUS.slice();
+  }
+  return ['Новая', 'Аннулирована', 'Отправлена в производство'];
+}
+
+/* ========================= API used by controller ========================= */
+
+/**
+ * Мета-данные для журнала.
+ */
+function extractMetaForLog_(sh) {
+  const kpNo = String(_safeFindValueByLabelInColD_(sh, 'Коммерческое предложение №') || '').trim();
+  const kpDate = _safeFindValueByLabelInColD_(sh, 'Дата КП');
+  const manager = String(_safeFindValueByLabelInColD_(sh, 'Менеджер') || '').trim();
+  const phone = String(_safeFindValueByLabelInColD_(sh, 'Телефон') || '').trim();
+  const customer = String(_safeFindValueByLabelInColD_(sh, 'Наименование Заказчика') || '').trim();
+  const customerAddr = String(_safeFindValueByLabelInColD_(sh, 'Адрес Заказчика') || '').trim();
+  const contractNo = String(_safeFindValueByLabelInColD_(sh, '№ Договора') || '').trim();
+
+  const discountPct = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'Скидка (-) / Наценка (+), %'));
+  const installPct = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'Размер монтажа от стоимости оборудования, %'));
+
+  let equipTotal = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'Итого за оборудование, руб'));
+  if (!equipTotal) equipTotal = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'Итого оборудование, руб'));
+
+  const installTotal = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'Монтаж, руб'));
+  const delivery = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'Доставка, руб'));
+  const toPay = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'Итого к оплате, руб'));
+
+  let vat = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'НДС 22%, руб'));
+  if (!vat) vat = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'В том числе НДС 22%, руб'));
+
+  const prepayPctNorm = _normalizePercentLoose_(
+    _safeFindTermsValueRight_(sh, 'Предоплата за оборудование составляет:')
+  );
+
+  let prepaySum = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'Сумма предоплаты, руб'));
+  if (!prepaySum && equipTotal && prepayPctNorm) prepaySum = equipTotal * prepayPctNorm;
+
+  const mainLead =
+    String(_safeFindTermsValueRight_(sh, 'Срок поставки Основное производство исчисляется с момента поступления предоплаты на р/счет и составляет:') || '').trim()
+    || String(_safeFindValueByLabelInColD_(sh, 'Срок (Основное)') || '').trim();
+
+  const ecoLead =
+    String(_safeFindTermsValueRight_(sh, 'Срок поставки ЭКО-серия исчисляется с момента поступления предоплаты на р/счет и составляет:') || '').trim()
+    || String(_safeFindValueByLabelInColD_(sh, 'Срок (ЭКО)') || '').trim();
+
+  const validDays =
+    _toNumberLoose_(_safeFindTermsValueRight_(sh, 'Данное КП действительно в течение:'))
+    || _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'КП действительно, дней'));
+
+  return {
+    timestamp: new Date(),
+    kpNo,
+    kpDate,
+    manager,
+    phone,
+    customer,
+    customerAddr,
+    contractNo,
+    discountPct,
+    installPct,
+    equipTotal,
+    installTotal,
+    delivery,
+    toPay,
+    vat,
+    prepayPctNorm,
+    prepaySum,
+    mainLead,
+    ecoLead,
+    validDays
+  };
+}
+
+/**
+ * Корзина КП -> JSON
+ * Пропускает строки без UID (если колонка UID есть), чтобы не тащить строки групп.
+ * Пропускает строки с qty <= 0.
+ */
+function extractCartAsJson_(sh) {
+  const headerRow = _findCartHeaderRow_(sh, 'Артикул');
+  if (!headerRow) return { items: [], jsonString: '[]' };
+
+  const maxCol = Math.min(50, sh.getLastColumn());
+  const hdr = sh.getRange(headerRow, 1, 1, maxCol).getDisplayValues()[0].map(_normHeader_);
+
+  const colArt = _colByName_(hdr, ['артикул']) || 1;
+  const colName = _colByContainsAll_(hdr, ['наименование']) || 4;
+  const colUnit = _colByName_(hdr, ['ед. изм', 'ед.изм.', 'ед.']) || 5;
+  const colPrice = _colByContainsAll_(hdr, ['стоимость', 'оборуд']) || 6;
+  const colQty = _colByContainsAll_(hdr, ['кол']) || 7;
+  const colSumEquip = _colByContainsAll_(hdr, ['всего', 'оборуд']) || 8;
+  const colInstallUnit = _colByContainsAll_(hdr, ['стоимость', 'монтаж']) || 9;
+  const colSumInstall = _colByContainsAll_(hdr, ['всего', 'монтаж']) || 10;
+  const colTotal = _colByName_(hdr, ['итого']) || 11;
+  const colNote = _colByName_(hdr, ['примечание', 'комментарий']) || 0;
+  const colDiscount = _colByContainsAll_(hdr, ['скидка', '%']) || 0;
+  const colUid = _colByName_(hdr, ['uid']) || 0;
+
+  const items = [];
+  const lastRow = sh.getLastRow();
+
+  for (let r = headerRow + 1; r <= lastRow; r++) {
+    const art = String(sh.getRange(r, colArt).getDisplayValue() || '').trim();
+    const name = String(sh.getRange(r, colName).getDisplayValue() || '').trim();
+
+    // пустой хвост
+    if (!art && !name) break;
+
+    // qty > 0 обязательно
+    const qty = _toNumberLoose_(sh.getRange(r, colQty).getValue());
+    if (!(qty > 0)) continue;
+
+    // Если есть UID-колонка — строки без UID считаем служебными/группами и пропускаем
+    const uid = colUid ? String(sh.getRange(r, colUid).getDisplayValue() || '').trim() : '';
+    if (colUid && !uid) continue;
+
+    // Артикул/наименование
+    if (!art && !name) continue;
+
+    const unit = String(sh.getRange(r, colUnit).getDisplayValue() || '').trim();
+    const price = _toNumberLoose_(sh.getRange(r, colPrice).getValue());
+    const sumEquip = _toNumberLoose_(sh.getRange(r, colSumEquip).getValue());
+    const installUnit = _toNumberLoose_(sh.getRange(r, colInstallUnit).getValue());
+    const sumInstall = _toNumberLoose_(sh.getRange(r, colSumInstall).getValue());
+    const total = _toNumberLoose_(sh.getRange(r, colTotal).getValue());
+    const note = colNote ? String(sh.getRange(r, colNote).getDisplayValue() || '').trim() : '';
+    const discountPct = colDiscount ? _toNumberLoose_(sh.getRange(r, colDiscount).getValue()) : '';
+
+    items.push({
+      uid: uid || '',
+      art,
+      name,
+      unit,
+      qty,
+      price,
+      sumEquip,
+      installUnit,
+      sumInstall,
+      total,
+      note,
+      discountPct
+    });
+  }
+
+  return { items, jsonString: JSON.stringify(items) };
+}
+
+function buildPdfFileName_(meta) {
+  const safe = (s) => String(s || '')
+    .replace(/[\\\/:*?"<>|]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80);
+
+  const dateStr = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  const kpNo = safe(meta.kpNo);
+  const cust = safe(meta.customer);
+
+  let name = 'КП';
+  if (kpNo) name += '_' + kpNo;
+  if (cust) name += '_' + cust;
+  name += '_' + dateStr;
+
+  return name;
+}
+
+/**
+ * Массив значений в порядке заголовков журнала (без жёсткой привязки к позициям колонок).
+ */
+function buildLogRow_(meta, cartJson, fileUrl, downloadUrl, fileId) {
+  return [
+    meta.timestamp,                                    // Дата/время выгрузки
+    meta.kpNo,                                         // КП №
+    meta.kpDate || '',                                 // Дата КП
+    meta.manager,                                      // Менеджер
+    meta.phone,                                        // Телефон
+    meta.customer,                                     // Заказчик
+    meta.customerAddr,                                 // Адрес заказчика
+    meta.contractNo,                                   // № договора
+    meta.discountPct,                                  // Скидка %
+    meta.installPct,                                   // Монтаж %
+    meta.equipTotal,                                   // Итого оборудование
+    meta.installTotal,                                 // Монтаж
+    meta.delivery,                                     // Доставка
+    meta.toPay,                                        // Итого к оплате
+    meta.vat,                                          // НДС
+    meta.prepayPctNorm ? (meta.prepayPctNorm * 100) : '', // Предоплата %
+    meta.prepaySum,                                    // Сумма предоплаты
+    meta.mainLead,                                     // Срок (Основное)
+    meta.ecoLead,                                      // Срок (ЭКО)
+    meta.validDays,                                    // КП действительно
+    cartJson,                                          // Позиции (JSON)
+    fileUrl,                                           // PDF URL
+    downloadUrl || '',                                 // PDF Download URL
+    fileId || '',                                      // Drive File ID
+    'Новая'                                            // Статус (новый)
+  ];
+}
+
+/**
+ * КРИТИЧЕСКОЕ:
+ * Пишем строку ПО ЗАГОЛОВКАМ листа, чтобы значения не съезжали.
+ */
+function appendToLog_(ss, rowArrayOrObject) {
+  const sh = ensureKpLogSchema_(ss);
+  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getDisplayValues()[0];
+  const normHeaders = headers.map(_normHeader_);
+
+  // Конфигурируемые заголовки "эталона"
+  const cfgHeaders = _getKpLogHeadersCfg_();
+
+  // Нормализованный словарь значений
+  const valueMap = {};
+
+  if (Array.isArray(rowArrayOrObject)) {
+    // Маппим массив по cfgHeaders
+    for (let i = 0; i < cfgHeaders.length; i++) {
+      valueMap[_normHeader_(cfgHeaders[i])] = (i < rowArrayOrObject.length) ? rowArrayOrObject[i] : '';
+    }
+  } else {
+    const obj = rowArrayOrObject || {};
+    Object.keys(obj).forEach(k => valueMap[_normHeader_(k)] = obj[k]);
+  }
+
+  // Гарантия статуса по умолчанию
+  const statusKey = _normHeader_('Статус');
+  if (!String(valueMap[statusKey] || '').trim()) {
+    valueMap[statusKey] = 'Новая';
+  }
+
+  // Собираем строку в реальном порядке заголовков листа
+  const row = normHeaders.map(h => (h in valueMap) ? valueMap[h] : '');
+
+  sh.appendRow(row);
+  const rowNum = sh.getLastRow();
+
+  // Формат денег (по именам заголовков)
+  const moneyNames = [
+    'Итого оборудование, руб',
+    'Монтаж, руб',
+    'Доставка, руб',
+    'Итого к оплате, руб',
+    'НДС 22%, руб',
+    'Сумма предоплаты, руб'
+  ].map(_normHeader_);
+
+  for (let c = 1; c <= normHeaders.length; c++) {
+    if (moneyNames.indexOf(normHeaders[c - 1]) >= 0) {
+      try { sh.getRange(rowNum, c).setNumberFormat('#,##0.00'); } catch (e) {}
+    }
+  }
+
+  // Валидация статуса на новой строке
+  ensureKpLogStatusValidation_(sh);
+
+  return rowNum;
+}
+
+/* ========================= Schema / Headers / Validation ========================= */
+
+function ensureKpLogSchema_(ss) {
+  const shName = _kpLogSheetName_();
+  let sh = ss.getSheetByName(shName);
+  if (!sh) sh = ss.insertSheet(shName);
+
+  const needHeaders = _getKpLogHeadersCfg_();
+  if (!needHeaders.length) throw new Error('Не определены заголовки для "Журнал КП".');
+
+  const lastCol = Math.max(sh.getLastColumn(), 1);
+  const currentHeaders = sh.getLastRow() >= 1
+    ? sh.getRange(1, 1, 1, lastCol).getDisplayValues()[0]
+    : [];
+
+  const currentNorm = currentHeaders.map(_normHeader_);
+  const needNorm = needHeaders.map(_normHeader_);
+
+  // Если шапки нет вообще — пишем целиком
+  if (currentHeaders.join('').trim() === '') {
+    sh.getRange(1, 1, 1, needHeaders.length).setValues([needHeaders]);
+  } else {
+    // Добавляем недостающие колонки справа
+    needHeaders.forEach((h, i) => {
+      if (currentNorm.indexOf(needNorm[i]) < 0) {
+        sh.insertColumnAfter(sh.getLastColumn());
+        sh.getRange(1, sh.getLastColumn()).setValue(h);
+      }
+    });
+  }
+
+  // Повторно читаем шапку
+  const finalHeaders = sh.getRange(1, 1, 1, sh.getLastColumn()).getDisplayValues()[0];
+  const finalNorm = finalHeaders.map(_normHeader_);
+
+  // Приведём названия (если совпали по смыслу, но пусто/криво) — не трогаем порядок, только гарантируем "Статус"
+  const statusIdx = finalNorm.indexOf(_normHeader_('Статус')) + 1;
+  if (!statusIdx) {
+    sh.insertColumnAfter(sh.getLastColumn());
+    sh.getRange(1, sh.getLastColumn()).setValue('Статус');
+  }
+
+  ensureKpLogStatusValidation_(sh);
+  return sh;
+}
+
+function ensureKpLogStatusValidation_(sh) {
+  if (!sh) return;
+  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getDisplayValues()[0].map(_normHeader_);
+  const statusCol = headers.indexOf(_normHeader_('Статус')) + 1;
+  if (!statusCol) return;
+
+  const statuses = _getKpStatusList_();
+  const rule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(statuses, true)
+    .setAllowInvalid(false)
+    .build();
+
+  // На все строки ниже шапки (с запасом)
+  const startRow = 2;
+  const numRows = Math.max(sh.getMaxRows() - 1, 1);
+  sh.getRange(startRow, statusCol, numRows, 1).setDataValidation(rule);
+
+  // Пустым существующим статусам — "Новая"
+  const lastRow = sh.getLastRow();
+  if (lastRow >= 2) {
+    const rng = sh.getRange(2, statusCol, lastRow - 1, 1);
+    const vals = rng.getValues();
+    let changed = false;
+    for (let i = 0; i < vals.length; i++) {
+      if (!String(vals[i][0] || '').trim()) {
+        vals[i][0] = 'Новая';
+        changed = true;
       }
     }
-  } catch (e) {}
-
-  try { SpreadsheetApp.flush(); } catch (e) {}
-  try { Utilities.sleep(800); } catch (e) {}
-
-  return state;
-}
-
-function restoreDiscountColumnAfterPdf_(sh, state) {
-  try {
-    if (state && state.col && !state.wasHidden) sh.showColumns(state.col);
-  } catch (e) {}
-
-  try {
-    if (state && state.extraCol && !state.extraWasHidden) sh.showColumns(state.extraCol);
-  } catch (e) {}
-
-  try { SpreadsheetApp.flush(); } catch (e) {}
-}
-
-function findCartHeaderRowByA_(sh, anchorText) {
-  const anchor = _norm_(anchorText);
-  const last = Math.min(600, sh.getLastRow());
-
-  for (let r = 1; r <= last; r++) {
-    const v = _norm_(sh.getRange(r, 1).getDisplayValue());
-    if (v === anchor) return r;
+    if (changed) rng.setValues(vals);
   }
-  return 0;
-}
-
-function findDiscountColInCartHeader_(sh, headerRow) {
-  const maxCol = Math.min(40, sh.getLastColumn());
-  const hdrs = sh.getRange(headerRow, 1, 1, maxCol).getDisplayValues()[0].map(_norm_);
-
-  for (let c = 0; c < hdrs.length; c++) {
-    const t = hdrs[c];
-    if (!t) continue;
-    if (t.includes('скидка') && t.includes('%')) return c + 1;
-  }
-  return 0;
 }

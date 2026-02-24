@@ -10,47 +10,52 @@
 var CFG = CFG || {};
 
 /* ========================================================================== */
-/* ЛИСТЫ                                                                        */
+/* Листы                                                                       */
 /* ========================================================================== */
 
-CFG.SHEETS = CFG.SHEETS || {
+CFG.SHEETS = Object.assign({
   DB: 'БД Оборудования',
   PRICE: 'Прайс',
   KP: 'КП',
   KP_LOG: 'Журнал КП',
+  DIRECTORY: 'Справочник',
+  LINKS_UID: 'Links_UID',
   PROD_REQUEST_LOG: 'Журнал заявок на производство'
-};
+}, CFG.SHEETS || {});
 
 /* ========================================================================== */
-/* ID (Google Drive)                                                            */
+/* ID (Google Drive)                                                           */
 /* ========================================================================== */
 
-CFG.IDS = CFG.IDS || {
+CFG.IDS = Object.assign({
   // файл шапки КП (картинка/док)
   HEADER_FILE_ID: '1E-6KvJH6CPFkEHgG0nLX_NE7rYlm67bw',
 
   // папка, куда сохраняем PDF КП
-  DRIVE_FOLDER_ID: '1o8lqVv3DlUe4e3bMpWKvNZncf5r_2xDD'
-};
+  DRIVE_FOLDER_ID: '1o8lqVv3DlUe4e3bMpWKvNZncf5r_2xDD',
+
+  // alias для совместимости (если где-то используется другое имя)
+  KP_PDF_FOLDER_ID: '1o8lqVv3DlUe4e3bMpWKvNZncf5r_2xDD'
+}, CFG.IDS || {});
 
 /* ========================================================================== */
-/* НАСТРОЙКИ ФОРМИРОВАНИЯ КП (КП.gs)                                            */
+/* Настройки формирования КП (КП.gs)                                           */
 /* ========================================================================== */
 
-CFG.KP = CFG.KP || {
+CFG.KP = Object.assign({
   COL_END: 11, // K
-
   DEFAULT_COL_WIDTH: 100,
   DEFAULT_ROW_HEIGHT: 21,
   FONT_SIZE: 20,
 
-  // Форматы
+  // форматы чисел
   NUM_FMT_MONEY: '#,##0.00',
   NUM_FMT_INT: '#,##0',
   NUM_FMT_PCT: '0.00',
   NUM_FMT_TEXT: '@',
 
-  // Строки параметров (после вставки пустой строки между блоками)
+  // строки параметров (после вставки пустой строки между блоками)
+  // ВАЖНО: здесь указаны строки для значений в колонке D
   PARAM_ROW_DISCOUNT: 19,     // D19 Скидка(-)/Наценка(+)
   PARAM_ROW_INSTALL_PCT: 20,  // D20 Монтаж, %
   PARAM_ROW_DELIVERY: 21,     // D21 Доставка, руб
@@ -64,44 +69,53 @@ CFG.KP = CFG.KP || {
     COST: 'Стоимость оборудования',
     QTY: 'Кол-во'
   }
-};
+}, CFG.KP || {});
 
 /* ========================================================================== */
-/* ДЕФОЛТНЫЕ ЗНАЧЕНИЯ ДЛЯ КП (КП.gs)                                            */
-/* ВАЖНО: это значения по умолчанию при формировании КП.                       */
-/* Если пользователь поменял их вручную в КП, а потом снова нажал buildKP(),   */
-/* они будут установлены заново.                                                */
+/* Дефолтные значения КП (могут меняться менеджером вручную в листе КП)        */
 /* ========================================================================== */
 
-CFG.KP_DEFAULTS = CFG.KP_DEFAULTS || {
-  DISCOUNT_PCT: 0,          // Скидка (-) / Наценка (+), %
-  INSTALL_PCT: 25,          // Размер монтажа от стоимости оборудования, %
-  DELIVERY_RUB: 0,          // Доставка, руб
-  PREPAY_SHARE: 0.7,        // Предоплата (доля): 0.7 = 70%
+CFG.KP_DEFAULTS = Object.assign({
+  DISCOUNT_PCT: 0,               // Скидка (-) / Наценка (+), %
+  INSTALL_PCT: 25,               // Размер монтажа от стоимости оборудования, %
+  DELIVERY_RUB: 0,               // Доставка, руб
+  PREPAY_SHARE: 0.7,             // Предоплата (доля): 0.7 = 70%
   LEAD_TIME_MAIN: '35-40 рабочих дней',
   LEAD_TIME_ECO: '40-45 рабочих дней',
-  VALID_DAYS: 7             // КП действительно, дней
-};
+  VALID_DAYS: 7                  // КП действительно, дней
+}, CFG.KP_DEFAULTS || {});
 
 /* ========================================================================== */
-/* СТРУКТУРЫ ЛИСТОВ (ЕДИНЫЙ ИСТОЧНИК ПРАВДЫ)                                    */
-/* Здесь храним только names + headers.                                         */
+/* Выпадающие списки                                                           */
 /* ========================================================================== */
 
-CFG.SHEET_SCHEMAS = CFG.SHEET_SCHEMAS || {
-  KP_LOG: {
-    sheetName: CFG.SHEETS.KP_LOG,
-    headers: [
+CFG.DROPDOWNS = Object.assign({}, CFG.DROPDOWNS || {});
+
+// Статусы в "Журнал КП"
+CFG.DROPDOWNS.KP_LOG_STATUS = Array.isArray(CFG.DROPDOWNS.KP_LOG_STATUS)
+  ? CFG.DROPDOWNS.KP_LOG_STATUS
+  : ['Новая', 'Аннулирована', 'Отправлена в производство'];
+
+/* ========================================================================== */
+/* Схемы листов (структуры таблиц)                                             */
+/* ========================================================================== */
+
+CFG.SCHEMAS = Object.assign({}, CFG.SCHEMAS || {});
+
+// Журнал КП (с колонкой "Статус")
+CFG.SCHEMAS.KP_LOG = Array.isArray(CFG.SCHEMAS.KP_LOG) && CFG.SCHEMAS.KP_LOG.length
+  ? CFG.SCHEMAS.KP_LOG
+  : [
       'Дата/время выгрузки',
       'КП №',
       'Дата КП',
       'Менеджер',
       'Телефон',
       'Заказчик',
-      'Адрес Заказчика',
-      '№ Договора',
-      'Скидка, %',
-      'Монтаж, %',
+      'Адрес заказчика',
+      '№ договора',
+      'Скидка (-) / Наценка (+), %',
+      'Размер монтажа от стоимости оборудования, %',
       'Итого оборудование, руб',
       'Монтаж, руб',
       'Доставка, руб',
@@ -114,63 +128,45 @@ CFG.SHEET_SCHEMAS = CFG.SHEET_SCHEMAS || {
       'КП действительно, дней',
       'Позиции (JSON)',
       'PDF URL (Drive)',
-      'Download URL',
+      'PDF Download URL',
       'Drive File ID',
       'Статус'
-    ]
-  },
+    ];
 
-  PROD_REQUEST_LOG: {
-    sheetName: CFG.SHEETS.PROD_REQUEST_LOG,
-    headers: [
+// Журнал заявок на производство
+CFG.SCHEMAS.PROD_REQUEST_LOG = Array.isArray(CFG.SCHEMAS.PROD_REQUEST_LOG) && CFG.SCHEMAS.PROD_REQUEST_LOG.length
+  ? CFG.SCHEMAS.PROD_REQUEST_LOG
+  : [
       'Дата/время создания',
-      '№ заявки на производство',
+      'Номер заявки на производство',
       'КП №',
       'Дата КП',
       'Заказчик',
-      'Адрес Заказчика',
+      'Адрес заказчика',
       'Менеджер',
       'Телефон',
-      'Drive File ID КП',
+      'Итого к оплате, руб',
       'PDF URL (Drive)',
-      'Кол-во позиций',
-      'Сумма количеств',
-      'UID_list',
+      'Drive File ID',
+      'Строка в Журнал КП',
       'Позиции (JSON)',
-      'Статус заявки',
       'Комментарий'
-    ]
-  }
-};
-
-/**
- * Возвращает имя листа по ключу схемы.
- * Пример: getSheetSchemaName_('KP_LOG')
- */
-function getSheetSchemaName_(schemaKey) {
-  if (!CFG.SHEET_SCHEMAS || !CFG.SHEET_SCHEMAS[schemaKey]) {
-    throw new Error('Не найдена схема листа: ' + schemaKey);
-  }
-  return CFG.SHEET_SCHEMAS[schemaKey].sheetName;
-}
-
-/**
- * Возвращает копию массива заголовков по ключу схемы.
- * Пример: getSheetSchemaHeaders_('KP_LOG')
- */
-function getSheetSchemaHeaders_(schemaKey) {
-  if (!CFG.SHEET_SCHEMAS || !CFG.SHEET_SCHEMAS[schemaKey]) {
-    throw new Error('Не найдена схема листа: ' + schemaKey);
-  }
-  var headers = CFG.SHEET_SCHEMAS[schemaKey].headers || [];
-  return headers.slice(); // защита от случайного изменения исходного массива
-}
+    ];
 
 /* ========================================================================== */
-/* НАСТРОЙКИ ЭКСПОРТА КП В PDF (КП pdf.gs)                                      */
+/* Настройки экспорта КП в PDF (КП pdf.gs / kp_pdf_export.gs)                  */
 /* ========================================================================== */
+/**
+ * ВАЖНО:
+ * Ранее здесь был сломанный фрагмент вида:
+ *   CFG.KP_PDF = ... / CFG.KP_PDF || {...}
+ * Из-за этого конфиг мог инициализироваться некорректно.
+ * Ниже — исправленный вариант.
+ */
 
-CFG.KP_PDF = CFG.KP_PDF || {
+CFG.KP_PDF = Object.assign({
+  DRIVE_FOLDER_ID: (CFG.IDS && (CFG.IDS.KP_PDF_FOLDER_ID || CFG.IDS.DRIVE_FOLDER_ID)) || '',
+
   EXCLUDE_BLOCK_TITLES: {
     SETTINGS: 'Настройки расчёта',
     TERMS: 'Условия и сроки поставки (изменяемые)'
@@ -182,15 +178,47 @@ CFG.KP_PDF = CFG.KP_PDF || {
 
   CART_HEADER: 'Артикул',
 
-  // Структура журнала КП берётся из единого блока схем
-  LOG_SHEET: getSheetSchemaName_('KP_LOG'),
-  LOG_HEADERS: getSheetSchemaHeaders_('KP_LOG')
-};
+  // Для совместимости со старыми участками кода
+  LOG_HEADERS: (CFG.SCHEMAS && CFG.SCHEMAS.KP_LOG)
+    ? CFG.SCHEMAS.KP_LOG.slice()
+    : [
+        'Дата/время выгрузки',
+        'КП №',
+        'Дата КП',
+        'Менеджер',
+        'Телефон',
+        'Заказчик',
+        'Адрес заказчика',
+        '№ договора',
+        'Скидка (-) / Наценка (+), %',
+        'Размер монтажа от стоимости оборудования, %',
+        'Итого оборудование, руб',
+        'Монтаж, руб',
+        'Доставка, руб',
+        'Итого к оплате, руб',
+        'НДС 22%, руб',
+        'Предоплата, %',
+        'Сумма предоплаты, руб',
+        'Срок (Основное)',
+        'Срок (ЭКО)',
+        'КП действительно, дней',
+        'Позиции (JSON)',
+        'PDF URL (Drive)',
+        'PDF Download URL',
+        'Drive File ID',
+        'Статус'
+      ]
+}, CFG.KP_PDF || {});
 
 /* ========================================================================== */
-/* СИНХРОНИЗАЦИЯ ИМЕН ЛИСТОВ С ЕДИНЫМИ СХЕМАМИ                                  */
-/* (На случай, если старые куски кода читают CFG.SHEETS напрямую)              */
+/* Совместимость: часть скриптов может использовать CFG.KP_EXPORT              */
 /* ========================================================================== */
 
-CFG.SHEETS.KP_LOG = getSheetSchemaName_('KP_LOG');
-CFG.SHEETS.PROD_REQUEST_LOG = getSheetSchemaName_('PROD_REQUEST_LOG');
+CFG.KP_EXPORT = Object.assign({
+  DRIVE_FOLDER_ID: CFG.KP_PDF.DRIVE_FOLDER_ID,
+  EXCLUDE_BLOCK_TITLES: CFG.KP_PDF.EXCLUDE_BLOCK_TITLES,
+  SETTINGS_ROWS_AFTER_TITLE: CFG.KP_PDF.SETTINGS_ROWS_AFTER_TITLE,
+  TERMS_ROWS_AFTER_TITLE: CFG.KP_PDF.TERMS_ROWS_AFTER_TITLE,
+  CART_HEADER: CFG.KP_PDF.CART_HEADER,
+  LOG_HEADERS: (CFG.SCHEMAS && CFG.SCHEMAS.KP_LOG) ? CFG.SCHEMAS.KP_LOG.slice() : CFG.KP_PDF.LOG_HEADERS
+}, CFG.KP_EXPORT || {});

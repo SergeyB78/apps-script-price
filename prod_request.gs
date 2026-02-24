@@ -1,636 +1,400 @@
-/** prod_request.gs
- * Заявка на производство по выбранной строке "Журнал КП"
- *
- * ВАЖНО:
- * - НЕ создаёт и НЕ дорабатывает "Журнал КП" (без дублирования существующей логики)
- * - Создаёт/доращивает только "Журнал заявок на производство"
- * - Работает с 1 колонкой статуса в "Журнал КП":
- *   "Статус" (предпочтительно) или "Статус КП" (fallback)
- */
-
-var PROD_REQ_CFG = PROD_REQ_CFG || {
-  // Листы (через централизованные схемы, если доступны)
-  KP_LOG_SHEET:
-    (typeof getSheetSchemaName_ === 'function')
-      ? getSheetSchemaName_('KP_LOG')
-      : 'Журнал КП',
-
-  PROD_LOG_SHEET:
-    (typeof getSheetSchemaName_ === 'function')
-      ? getSheetSchemaName_('PROD_REQUEST_LOG')
-      : 'Журнал заявок на производство',
-
-  // Статусы (одна колонка в Журнале КП)
-  STATUS_VALUES: ['Новая', 'Аннулирована', 'Отправлена в производство'],
-  STATUS_NEW: 'Новая',
-  STATUS_CANCELED: 'Аннулирована',
-  STATUS_SENT: 'Отправлена в производство',
-
-  // Возможные названия колонки статуса
-  STATUS_HEADER_ALIASES: ['Статус', 'Статус КП'],
-
-  // Заголовки журнала заявок на производство (из схемы, если доступна)
-  PROD_LOG_HEADERS:
-    (typeof getSheetSchemaHeaders_ === 'function')
-      ? getSheetSchemaHeaders_('PROD_REQUEST_LOG')
-      : [
-          'Дата/время создания',
-          '№ заявки на производство',
-          'КП №',
-          'Дата КП',
-          'Заказчик',
-          'Адрес Заказчика',
-          'Менеджер',
-          'Телефон',
-          'Drive File ID КП',
-          'PDF URL (Drive)',
-          'Кол-во позиций',
-          'Сумма количеств',
-          'UID_list',
-          'Позиции (JSON)',
-          'Статус заявки',
-          'Комментарий'
-        ]
-};
-
-/* ========================================================================== */
-/* ПУБЛИЧНЫЕ ФУНКЦИИ                                                            */
-/* ========================================================================== */
-
 /**
- * Основная команда меню:
- * создать заявку на производство по активной строке листа "Журнал КП"
+ * prod_request.gs — создание заявки на производство из выбранной строки "Журнал КП"
+ *
+ * Логика:
+ * - Менеджер стоит на строке в "Журнал КП"
+ * - Запускает функцию из меню (подключите в ваш существующий menu builder)
+ * - Вводит номер заявки вручную
+ * - В "Журнал заявок на производство" пишется запись
+ * - В "Журнал КП" выбранной записи -> статус "Отправлена в производство"
+ * - Для дублей (тот же КП № + Заказчик, но другой Drive File ID) -> статус "Аннулирована"
  */
-function createProductionOrderFromSelectedKp() {
-  var ui = SpreadsheetApp.getUi();
-  var ss = SpreadsheetApp.getActive();
-  var lock = LockService.getDocumentLock();
 
-  if (!lock.tryLock(30000)) {
-    ui.alert('Не удалось получить блокировку документа. Повторите через несколько секунд.');
+function createProductionRequestFromSelectedKp() {
+  const ss = SpreadsheetApp.getActive();
+
+  const kpLog = ensureKpLogSchema_(ss);
+  const prodLog = ensureProductionRequestLogSchema_(ss);
+
+  const activeSheet = ss.getActiveSheet();
+  if (!activeSheet || activeSheet.getName() !== kpLog.getName()) {
+    SpreadsheetApp.getUi().alert(
+      'Для создания заявки на производство перейдите на лист "' + kpLog.getName() + '" и выделите нужную строку.'
+    );
     return;
   }
 
-  try {
-    // Создаём/доращиваем только журнал заявок на производство
-    var prodLog = ensureProductionLogSheet_();
+  const row = activeSheet.getActiveRange() ? activeSheet.getActiveRange().getRow() : 0;
+  if (row < 2) {
+    SpreadsheetApp.getUi().alert('Выберите строку в "Журнал КП" (не шапку).');
+    return;
+  }
 
-    var sh = ss.getActiveSheet();
-    if (!sh || sh.getName() !== PROD_REQ_CFG.KP_LOG_SHEET) {
-      ui.alert(
-        'Откройте лист "' + PROD_REQ_CFG.KP_LOG_SHEET + '" и выберите строку КП, ' +
-        'по которой нужно создать заявку на производство.'
-      );
-      return;
-    }
+  const kpRow = getKpLogRowAsObject_(kpLog, row);
 
-    var activeRange = sh.getActiveRange();
-    if (!activeRange) {
-      ui.alert('Выберите строку в листе "' + PROD_REQ_CFG.KP_LOG_SHEET + '".');
-      return;
-    }
+  // Обязательные поля для заявки на производство
+  const driveFileId = String(kpRow['Drive File ID'] || '').trim();
+  const kpNo = String(kpRow['КП №'] || '').trim();
+  const customer = String(kpRow['Заказчик'] || '').trim();
+  const status = String(kpRow['Статус'] || '').trim() || 'Новая';
 
-    var row = activeRange.getRow();
-    if (row < 2) {
-      ui.alert('Выберите строку данных (не заголовок).');
-      return;
-    }
-
-    var kpMap = getHeaderMap_(sh);
-    if (!Object.keys(kpMap).length) {
-      ui.alert('Не удалось прочитать заголовки листа "' + PROD_REQ_CFG.KP_LOG_SHEET + '".');
-      return;
-    }
-
-    var col = resolveKpColumns_(kpMap);
-    validateRequiredKpColumns_(col);
-
-    var rowObj = readRowObject_(sh, row);
-
-    var kpNo = strv_(rowObj[col.kpNo]);
-    var customer = strv_(rowObj[col.customer]);
-    var fileId = strv_(rowObj[col.driveFileId]);
-    var positionsJsonRaw = rowObj[col.positionsJson];
-    var currentStatus = strv_(rowObj[col.status]) || PROD_REQ_CFG.STATUS_NEW;
-
-    // Проверка обязательных значений в выбранной строке
-    var missingValues = [];
-    if (!kpNo) missingValues.push('КП №');
-    if (!customer) missingValues.push('Заказчик');
-    if (!fileId) missingValues.push('Drive File ID');
-    if (!strv_(positionsJsonRaw)) missingValues.push('Позиции (JSON)');
-
-    if (missingValues.length) {
-      ui.alert(
-        'Нельзя создать заявку на производство.\n\n' +
-        'В выбранной строке не заполнены поля:\n- ' + missingValues.join('\n- ')
-      );
-      return;
-    }
-
-    // Проверка статуса выбранной строки
-    if (currentStatus === PROD_REQ_CFG.STATUS_CANCELED) {
-      ui.alert('У выбранной записи статус "' + PROD_REQ_CFG.STATUS_CANCELED + '". Создание заявки запрещено.');
-      return;
-    }
-    if (currentStatus === PROD_REQ_CFG.STATUS_SENT) {
-      ui.alert('По выбранной записи уже создана заявка на производство (статус "' + PROD_REQ_CFG.STATUS_SENT + '").');
-      return;
-    }
-
-    // Парсим "Позиции (JSON)"
-    var parsed = parsePositionsJsonSafe_(positionsJsonRaw);
-    if (!parsed.ok) {
-      ui.alert(
-        'Невозможно создать заявку: поле "Позиции (JSON)" заполнено некорректно.\n\n' +
-        parsed.error
-      );
-      return;
-    }
-
-    var stats = summarizePositionsForProduction_(parsed.items);
-    if (stats.itemsCount <= 0) {
-      ui.alert('Невозможно создать заявку: в "Позиции (JSON)" не найдено позиций для производства.');
-      return;
-    }
-
-    // Находим дубли по (КП № + Заказчик)
-    var duplicates = findDuplicateRowsByKpNoAndCustomer_(sh, kpMap, col, kpNo, customer);
-
-    // Если среди дублей уже есть запись "Отправлена в производство" (не текущая) — блокируем
-    var existingSent = null;
-    for (var i = 0; i < duplicates.length; i++) {
-      var d = duplicates[i];
-      if (d.row === row) continue;
-      if (d.status === PROD_REQ_CFG.STATUS_SENT) {
-        existingSent = d;
-        break;
-      }
-    }
-
-    if (existingSent) {
-      ui.alert(
-        'По этой группе КП (Клиент + № КП) уже есть заявка в производство.\n\n' +
-        'Строка: ' + existingSent.row + '\n' +
-        'Статус: ' + existingSent.status + '\n\n' +
-        'Повторное создание запрещено.'
-      );
-      return;
-    }
-
-    // Ввод номера заявки
-    var suggestedNo = suggestProductionRequestNo_(kpNo);
-    var promptRes = ui.prompt(
-      'Заявка на производство',
-      'Введите номер заявки на производство.\n\n' +
-      'КП №: ' + kpNo + '\n' +
-      'Заказчик: ' + customer + '\n' +
-      'Позиции: ' + stats.itemsCount + '\n' +
-      'Сумма количеств: ' + stats.qtySum + '\n\n' +
-      'Если оставить пусто — будет подставлен номер:\n' + suggestedNo,
-      ui.ButtonSet.OK_CANCEL
+  if (!driveFileId) {
+    SpreadsheetApp.getUi().alert(
+      'Нельзя создать заявку на производство.\n\nВ выбранной строке "Журнал КП" не заполнен "Drive File ID".'
     );
+    return;
+  }
 
-    if (promptRes.getSelectedButton() !== ui.Button.OK) return;
+  if (!kpNo) {
+    SpreadsheetApp.getUi().alert('Нельзя создать заявку на производство: не заполнен "КП №" в журнале.');
+    return;
+  }
 
-    var reqNo = strv_(promptRes.getResponseText());
-    if (!reqNo) reqNo = suggestedNo;
+  if (!customer) {
+    SpreadsheetApp.getUi().alert('Нельзя создать заявку на производство: не заполнен "Заказчик" в журнале.');
+    return;
+  }
 
-    // Финальное подтверждение
-    var confirmText =
-      'Будет создана заявка на производство:\n\n' +
-      '№ заявки: ' + reqNo + '\n' +
-      'КП №: ' + kpNo + '\n' +
-      'Заказчик: ' + customer + '\n' +
-      'Позиции: ' + stats.itemsCount + '\n' +
-      'Сумма количеств: ' + stats.qtySum + '\n' +
-      'UID: ' + (stats.uidList || '-') + '\n\n' +
-      'После подтверждения:\n' +
-      '• выбранная запись → "' + PROD_REQ_CFG.STATUS_SENT + '"\n' +
-      '• дубли (тот же клиент + тот же № КП) → "' + PROD_REQ_CFG.STATUS_CANCELED + '"';
+  if (status === 'Отправлена в производство') {
+    SpreadsheetApp.getUi().alert('По этой записи уже создана заявка на производство.');
+    return;
+  }
 
-    var ok = ui.alert('Подтверждение', confirmText, ui.ButtonSet.YES_NO);
-    if (ok !== ui.Button.YES) return;
+  if (status === 'Аннулирована') {
+    SpreadsheetApp.getUi().alert('Выбранная запись имеет статус "Аннулирована". Создание заявки запрещено.');
+    return;
+  }
 
-    // Запись в "Журнал заявок на производство"
-    var prodMap = getHeaderMap_(prodLog);
+  // Проверка, что по данному КП+заказчику уже не отправлена другая запись в производство
+  const existingSent = findAnotherSentProductionByKpAndCustomer_(kpLog, kpNo, customer, driveFileId);
+  if (existingSent) {
+    SpreadsheetApp.getUi().alert(
+      'Заявка на производство уже создана по дублю этого КП.\n\n' +
+      'Строка журнала КП: ' + existingSent.row + '\n' +
+      'Статус: Отправлена в производство\n\n' +
+      'Для текущей строки создание заявки запрещено.'
+    );
+    return;
+  }
 
-    var prodRowObj = {};
-    prodRowObj['Дата/время создания'] = new Date();
-    prodRowObj['№ заявки на производство'] = reqNo;
-    prodRowObj['КП №'] = kpNo;
-    prodRowObj['Дата КП'] = col.kpDate ? (rowObj[col.kpDate] || '') : '';
-    prodRowObj['Заказчик'] = customer;
-    prodRowObj['Адрес Заказчика'] = col.customerAddr ? (rowObj[col.customerAddr] || '') : '';
-    prodRowObj['Менеджер'] = col.manager ? (rowObj[col.manager] || '') : '';
-    prodRowObj['Телефон'] = col.phone ? (rowObj[col.phone] || '') : '';
-    prodRowObj['Drive File ID КП'] = fileId;
-    prodRowObj['PDF URL (Drive)'] = col.pdfUrl ? (rowObj[col.pdfUrl] || '') : '';
-    prodRowObj['Кол-во позиций'] = stats.itemsCount;
-    prodRowObj['Сумма количеств'] = stats.qtySum;
-    prodRowObj['UID_list'] = stats.uidList;
-    prodRowObj['Позиции (JSON)'] = parsed.rawString;
-    prodRowObj['Статус заявки'] = 'Создана';
-    prodRowObj['Комментарий'] = '';
+  const previewText = buildProdRequestPreviewText_(kpRow);
 
-    var prodRow = appendObjectByHeaders_(prodLog, prodRowObj, prodMap);
-    formatProductionLogRow_(prodLog, prodRow);
+  // Подтверждение
+  const ui = SpreadsheetApp.getUi();
+  const confirm = ui.alert(
+    'Создать заявку на производство',
+    previewText + '\n\nПродолжить?',
+    ui.ButtonSet.YES_NO
+  );
+  if (confirm !== ui.Button.YES) return;
 
-    // Обновляем статусы в "Журнал КП"
-    setCellValue_(sh, row, col.status, PROD_REQ_CFG.STATUS_SENT);
+  // Ввод номера заявки
+  const prompt = ui.prompt(
+    'Номер заявки на производство',
+    'Введите номер заявки (можно вручную):',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (prompt.getSelectedButton() !== ui.Button.OK) return;
 
-    // Все дубли (кроме выбранной строки) -> Аннулирована
-    for (var j = 0; j < duplicates.length; j++) {
-      var dup = duplicates[j];
-      if (dup.row === row) continue;
-      setCellValue_(sh, dup.row, col.status, PROD_REQ_CFG.STATUS_CANCELED);
-    }
+  const requestNo = String(prompt.getResponseText() || '').trim();
+  if (!requestNo) {
+    ui.alert('Создание отменено: номер заявки не введён.');
+    return;
+  }
 
-    SpreadsheetApp.flush();
-
+  // Повторная защита от дубля в журнале заявок (по номеру заявки + Drive File ID)
+  const dupProd = findProdRequestDuplicate_(prodLog, requestNo, driveFileId);
+  if (dupProd) {
     ui.alert(
-      'Готово.\n\n' +
-      'Заявка на производство создана.\n' +
-      'Строка в "' + PROD_REQ_CFG.PROD_LOG_SHEET + '": ' + prodRow + '\n' +
-      'Статусы в "' + PROD_REQ_CFG.KP_LOG_SHEET + '" обновлены.'
+      'Такая заявка уже есть в "Журнал заявок на производство".\n\n' +
+      'Строка: ' + dupProd.row + '\n' +
+      'Номер заявки: ' + requestNo
     );
-
-  } catch (err) {
-    SpreadsheetApp.getUi().alert('Ошибка: ' + (err && err.message ? err.message : err));
-    throw err;
-  } finally {
-    try { lock.releaseLock(); } catch (e) {}
+    return;
   }
+
+  // Пишем в журнал заявок на производство
+  const prodRow = buildProdRequestLogRow_(kpRow, requestNo);
+  const prodRowNum = appendProductionRequestToLog_(prodLog, prodRow);
+
+  // Статусы в Журнале КП:
+  // - текущая строка = "Отправлена в производство"
+  setKpLogStatusByRow_(kpLog, row, 'Отправлена в производство');
+
+  // - дубли (тот же КП № + Заказчик, другой Drive File ID) = "Аннулирована"
+  const cancelledCount = cancelDuplicateKpRows_(kpLog, {
+    kpNo: kpNo,
+    customer: customer,
+    exceptDriveFileId: driveFileId,
+    keepRow: row
+  });
+
+  ui.alert(
+    'Заявка на производство создана.\n\n' +
+    'Строка в журнале заявок: ' + prodRowNum + '\n' +
+    'Номер заявки: ' + requestNo + '\n' +
+    'Статус текущей записи КП: Отправлена в производство\n' +
+    'Аннулировано дублей: ' + cancelledCount
+  );
 }
 
-/**
- * Можно запускать вручную один раз, чтобы создать/обновить "Журнал заявок на производство"
- * (Журнал КП не трогает)
- */
-function ensureProductionLogSheetManual_() {
-  ensureProductionLogSheet_();
-  SpreadsheetApp.getUi().alert('Лист "' + PROD_REQ_CFG.PROD_LOG_SHEET + '" проверен/подготовлен.');
+/* ========================= Schema: Журнал заявок на производство ========================= */
+
+function _prodReqSheetName_() {
+  return (typeof CFG !== 'undefined' && CFG.SHEETS && CFG.SHEETS.PROD_REQUEST_LOG)
+    ? CFG.SHEETS.PROD_REQUEST_LOG
+    : 'Журнал заявок на производство';
 }
 
-/* ========================================================================== */
-/* ЖУРНАЛ ЗАЯВОК НА ПРОИЗВОДСТВО                                                */
-/* ========================================================================== */
+function _prodReqHeaders_() {
+  if (typeof CFG !== 'undefined' && CFG.SCHEMAS && Array.isArray(CFG.SCHEMAS.PROD_REQUEST_LOG) && CFG.SCHEMAS.PROD_REQUEST_LOG.length) {
+    return CFG.SCHEMAS.PROD_REQUEST_LOG.slice();
+  }
+  return [
+    'Дата/время создания',
+    'Номер заявки на производство',
+    'КП №',
+    'Дата КП',
+    'Заказчик',
+    'Адрес заказчика',
+    'Менеджер',
+    'Телефон',
+    'Итого к оплате, руб',
+    'PDF URL (Drive)',
+    'Drive File ID',
+    'Строка в Журнал КП',
+    'Позиции (JSON)',
+    'Комментарий'
+  ];
+}
 
-function ensureProductionLogSheet_() {
-  var ss = SpreadsheetApp.getActive();
-  var sh = ss.getSheetByName(PROD_REQ_CFG.PROD_LOG_SHEET);
+function ensureProductionRequestLogSchema_(ss) {
+  const name = _prodReqSheetName_();
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
 
-  if (!sh) {
-    sh = ss.insertSheet(PROD_REQ_CFG.PROD_LOG_SHEET);
-    sh.getRange(1, 1, 1, PROD_REQ_CFG.PROD_LOG_HEADERS.length).setValues([PROD_REQ_CFG.PROD_LOG_HEADERS]);
-    sh.setFrozenRows(1);
-    safeAutoResize_(sh, 1, PROD_REQ_CFG.PROD_LOG_HEADERS.length);
+  const need = _prodReqHeaders_();
+  const lastCol = Math.max(sh.getLastColumn(), 1);
+
+  const current = sh.getLastRow() >= 1
+    ? sh.getRange(1, 1, 1, lastCol).getDisplayValues()[0]
+    : [];
+
+  const currentNorm = current.map(_normProdHeader_);
+  const needNorm = need.map(_normProdHeader_);
+
+  if (current.join('').trim() === '') {
+    sh.getRange(1, 1, 1, need.length).setValues([need]);
     return sh;
   }
 
-  // Если лист есть, но пустой
-  if (sh.getLastRow() === 0 || sh.getLastColumn() === 0) {
-    sh.getRange(1, 1, 1, PROD_REQ_CFG.PROD_LOG_HEADERS.length).setValues([PROD_REQ_CFG.PROD_LOG_HEADERS]);
-    sh.setFrozenRows(1);
-    safeAutoResize_(sh, 1, PROD_REQ_CFG.PROD_LOG_HEADERS.length);
-    return sh;
-  }
-
-  // Доращиваем отсутствующие колонки по заголовкам
-  var map = getHeaderMap_(sh);
-  var changed = false;
-
-  for (var i = 0; i < PROD_REQ_CFG.PROD_LOG_HEADERS.length; i++) {
-    var h = PROD_REQ_CFG.PROD_LOG_HEADERS[i];
-    if (!map[h]) {
+  // Добавляем недостающие справа
+  need.forEach((h, i) => {
+    if (currentNorm.indexOf(needNorm[i]) < 0) {
       sh.insertColumnAfter(sh.getLastColumn());
       sh.getRange(1, sh.getLastColumn()).setValue(h);
-      changed = true;
     }
-  }
-
-  if (changed) {
-    sh.setFrozenRows(1);
-    safeAutoResize_(sh, 1, sh.getLastColumn());
-  }
+  });
 
   return sh;
 }
 
-/* ========================================================================== */
-/* ПОИСК И ВАЛИДАЦИЯ КОЛОНОК В "ЖУРНАЛ КП"                                       */
-/* ========================================================================== */
-
-function resolveKpColumns_(headerMap) {
-  return {
-    // обязательные
-    kpNo: findHeaderKeyByAliases_(headerMap, ['КП №', '№ КП']),
-    customer: findHeaderKeyByAliases_(headerMap, ['Заказчик', 'Наименование Заказчика']),
-    driveFileId: findHeaderKeyByAliases_(headerMap, ['Drive File ID КП', 'Drive File ID']),
-    positionsJson: findHeaderKeyByAliases_(headerMap, ['Позиции (JSON)']),
-    status: findHeaderKeyByAliases_(headerMap, PROD_REQ_CFG.STATUS_HEADER_ALIASES),
-
-    // необязательные
-    kpDate: findHeaderKeyByAliases_(headerMap, ['Дата КП']),
-    customerAddr: findHeaderKeyByAliases_(headerMap, ['Адрес Заказчика', 'Адрес заказчика']),
-    manager: findHeaderKeyByAliases_(headerMap, ['Менеджер']),
-    phone: findHeaderKeyByAliases_(headerMap, ['Телефон']),
-    pdfUrl: findHeaderKeyByAliases_(headerMap, ['PDF URL (Drive)', 'PDF URL', 'Ссылка на PDF'])
-  };
+function _normProdHeader_(s) {
+  return String(s || '')
+    .replace(/\n+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
 }
 
-function validateRequiredKpColumns_(col) {
-  var missing = [];
+/* ========================= Чтение строки Журнал КП ========================= */
 
-  if (!col.kpNo) missing.push('КП № / № КП');
-  if (!col.customer) missing.push('Заказчик');
-  if (!col.driveFileId) missing.push('Drive File ID (или Drive File ID КП)');
-  if (!col.positionsJson) missing.push('Позиции (JSON)');
-  if (!col.status) missing.push('Статус (или Статус КП)');
+function getKpLogRowAsObject_(kpLogSheet, row) {
+  const lastCol = kpLogSheet.getLastColumn();
+  const headers = kpLogSheet.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  const values = kpLogSheet.getRange(row, 1, 1, lastCol).getValues()[0];
+  const display = kpLogSheet.getRange(row, 1, 1, lastCol).getDisplayValues()[0];
 
-  if (missing.length) {
-    throw new Error(
-      'В листе "Журнал КП" не найдены обязательные колонки:\n- ' +
-      missing.join('\n- ') +
-      '\n\nПроверьте названия заголовков.'
-    );
-  }
-}
-
-/* ========================================================================== */
-/* ДУБЛИКАТЫ: (КП № + ЗАКАЗЧИК)                                                  */
-/* ========================================================================== */
-
-function findDuplicateRowsByKpNoAndCustomer_(sh, headerMap, col, kpNoValue, customerValue) {
-  var lastRow = sh.getLastRow();
-  if (lastRow < 2) return [];
-
-  var lastCol = sh.getLastColumn();
-  var data = sh.getRange(2, 1, lastRow - 1, lastCol).getDisplayValues();
-
-  var kpNoIdx = headerMap[col.kpNo] - 1;
-  var customerIdx = headerMap[col.customer] - 1;
-  var statusIdx = headerMap[col.status] - 1;
-
-  var kpNoKey = normText_(kpNoValue);
-  var customerKey = normText_(customerValue);
-
-  var out = [];
-
-  for (var i = 0; i < data.length; i++) {
-    var rowNum = i + 2;
-    var rowVals = data[i];
-
-    var rowKpNo = normText_(rowVals[kpNoIdx]);
-    var rowCustomer = normText_(rowVals[customerIdx]);
-
-    if (!rowKpNo || !rowCustomer) continue;
-    if (rowKpNo !== kpNoKey) continue;
-    if (rowCustomer !== customerKey) continue;
-
-    out.push({
-      row: rowNum,
-      status: strv_(rowVals[statusIdx]) || PROD_REQ_CFG.STATUS_NEW
-    });
+  const obj = {};
+  for (let i = 0; i < headers.length; i++) {
+    const key = String(headers[i] || '').trim();
+    if (!key) continue;
+    obj[key] = values[i];
+    obj[key + '__display'] = display[i];
   }
 
-  return out;
-}
-
-/* ========================================================================== */
-/* ПАРСИНГ И АГРЕГАЦИЯ "Позиции (JSON)"                                           */
-/* ========================================================================== */
-
-function parsePositionsJsonSafe_(raw) {
-  try {
-    var s = typeof raw === 'string' ? raw : String(raw || '');
-    s = s.trim();
-    if (!s) return { ok: false, error: 'Пустое значение JSON.' };
-
-    var parsed = JSON.parse(s);
-
-    // Поддержка разных форматов:
-    // 1) [ {...}, {...} ]
-    // 2) { items: [ ... ] }
-    var items = [];
-    if (Array.isArray(parsed)) {
-      items = parsed;
-    } else if (parsed && Array.isArray(parsed.items)) {
-      items = parsed.items;
-    } else {
-      return { ok: false, error: 'Ожидался массив позиций или объект с полем items.' };
-    }
-
-    return {
-      ok: true,
-      items: items,
-      rawString: s
-    };
-  } catch (e) {
-    return {
-      ok: false,
-      error: e && e.message ? e.message : String(e)
-    };
-  }
-}
-
-function summarizePositionsForProduction_(items) {
-  var itemsCount = 0;
-  var qtySum = 0;
-  var uidArr = [];
-
-  if (!Array.isArray(items)) {
-    return { itemsCount: 0, qtySum: 0, uidList: '' };
-  }
-
-  for (var i = 0; i < items.length; i++) {
-    var it = items[i] || {};
-
-    // Кол-во (ищем по типичным ключам)
-    var qty = pickNumberByKeys_(it, [
-      'qty', 'quantity', 'Кол-во', 'Количество',
-      'count', 'qnty'
-    ]);
-
-    if (qty > 0) {
-      itemsCount++;
-      qtySum += qty;
-    } else {
-      // fallback: если qty отсутствует, но позиция есть — считаем как 1 позицию
-      var hasArt = !!strv_(pickAny_(it, ['art', 'Артикул', 'sku']));
-      var hasName = !!strv_(pickAny_(it, ['name', 'Наименование']));
-      if (hasArt || hasName) {
-        itemsCount++;
-      }
-    }
-
-    // UID (ищем по типичным ключам)
-    var uid = strv_(pickAny_(it, [
-      'uid', 'UID', 'priceUid', 'price_uid', 'uid_price', 'UID_Прайс'
-    ]));
-
-    if (uid && uidArr.indexOf(uid) === -1) {
-      uidArr.push(uid);
-    }
-  }
-
-  return {
-    itemsCount: itemsCount,
-    qtySum: qtySum,
-    uidList: uidArr.join(';')
-  };
-}
-
-/* ========================================================================== */
-/* ЗАПИСЬ В ЖУРНАЛ ЗАЯВОК ПО ЗАГОЛОВКАМ                                           */
-/* ========================================================================== */
-
-function appendObjectByHeaders_(sheet, obj, headerMap) {
-  var sh = sheet;
-  var map = headerMap || getHeaderMap_(sh);
-
-  var lastCol = sh.getLastColumn();
-  if (lastCol < 1) throw new Error('Лист "' + sh.getName() + '" не содержит заголовков.');
-
-  var headers = sh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
-  var rowOut = [];
-
-  for (var i = 0; i < headers.length; i++) {
-    var h = strv_(headers[i]);
-    rowOut.push(Object.prototype.hasOwnProperty.call(obj, h) ? obj[h] : '');
-  }
-
-  var nextRow = Math.max(2, sh.getLastRow() + 1);
-  sh.getRange(nextRow, 1, 1, rowOut.length).setValues([rowOut]);
-
-  return nextRow;
-}
-
-function formatProductionLogRow_(sh, row) {
-  var map = getHeaderMap_(sh);
-
-  var cTime = map['Дата/время создания'];
-  if (cTime) sh.getRange(row, cTime).setNumberFormat('dd.MM.yyyy HH:mm:ss');
-
-  var cJson = map['Позиции (JSON)'];
-  if (cJson) sh.setColumnWidth(cJson, Math.max(sh.getColumnWidth(cJson), 380));
-
-  var cUrl = map['PDF URL (Drive)'];
-  if (cUrl) sh.setColumnWidth(cUrl, Math.max(sh.getColumnWidth(cUrl), 260));
-}
-
-/* ========================================================================== */
-/* ОБЩИЕ HELPERS                                                                 */
-/* ========================================================================== */
-
-function getHeaderMap_(sh) {
-  var lastCol = sh.getLastColumn();
-  if (lastCol < 1) return {};
-
-  var headers = sh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
-  var map = {};
-
-  for (var i = 0; i < headers.length; i++) {
-    var h = strv_(headers[i]);
-    if (h && !map[h]) map[h] = i + 1; // 1-based
-  }
-
-  return map;
-}
-
-function readRowObject_(sh, row) {
-  var lastCol = sh.getLastColumn();
-  var headers = sh.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
-  var vals = sh.getRange(row, 1, 1, lastCol).getValues()[0];
-
-  var obj = {};
-  for (var i = 0; i < headers.length; i++) {
-    var h = strv_(headers[i]);
-    if (!h) continue;
-    obj[h] = vals[i];
-  }
-
+  obj.__row = row;
   return obj;
 }
 
-function findHeaderKeyByAliases_(headerMap, aliases) {
-  if (!headerMap) return '';
+function buildProdRequestPreviewText_(kpRow) {
+  return [
+    'Будет создана заявка на производство по записи "Журнал КП":',
+    '',
+    'Строка журнала КП: ' + (kpRow.__row || ''),
+    'КП №: ' + String(kpRow['КП №'] || ''),
+    'Дата КП: ' + String(kpRow['Дата КП__display'] || kpRow['Дата КП'] || ''),
+    'Заказчик: ' + String(kpRow['Заказчик'] || ''),
+    'Адрес: ' + String(kpRow['Адрес заказчика'] || ''),
+    'Менеджер: ' + String(kpRow['Менеджер'] || ''),
+    'Телефон: ' + String(kpRow['Телефон'] || ''),
+    'Итого к оплате: ' + String(kpRow['Итого к оплате, руб__display'] || kpRow['Итого к оплате, руб'] || ''),
+    'Drive File ID: ' + String(kpRow['Drive File ID'] || ''),
+    '',
+    'После создания:',
+    '• текущая запись получит статус "Отправлена в производство";',
+    '• дубли (тот же КП № + Заказчик) будут помечены "Аннулирована".'
+  ].join('\n');
+}
 
-  // Точное совпадение
-  for (var i = 0; i < aliases.length; i++) {
-    if (headerMap[aliases[i]]) return aliases[i];
+/* ========================= Запись в журнал заявок ========================= */
+
+function buildProdRequestLogRow_(kpRow, requestNo) {
+  return {
+    'Дата/время создания': new Date(),
+    'Номер заявки на производство': requestNo,
+    'КП №': kpRow['КП №'] || '',
+    'Дата КП': kpRow['Дата КП'] || '',
+    'Заказчик': kpRow['Заказчик'] || '',
+    'Адрес заказчика': kpRow['Адрес заказчика'] || '',
+    'Менеджер': kpRow['Менеджер'] || '',
+    'Телефон': kpRow['Телефон'] || '',
+    'Итого к оплате, руб': kpRow['Итого к оплате, руб'] || '',
+    'PDF URL (Drive)': kpRow['PDF URL (Drive)'] || '',
+    'Drive File ID': kpRow['Drive File ID'] || '',
+    'Строка в Журнал КП': kpRow.__row || '',
+    'Позиции (JSON)': kpRow['Позиции (JSON)'] || '',
+    'Комментарий': ''
+  };
+}
+
+function appendProductionRequestToLog_(sh, rowObj) {
+  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getDisplayValues()[0];
+  const row = headers.map(h => rowObj.hasOwnProperty(h) ? rowObj[h] : '');
+  sh.appendRow(row);
+
+  const rowNum = sh.getLastRow();
+
+  // Форматы
+  const hdrNorm = headers.map(_normProdHeader_);
+  const cMoney = hdrNorm.indexOf(_normProdHeader_('Итого к оплате, руб')) + 1;
+  if (cMoney) {
+    try { sh.getRange(rowNum, cMoney).setNumberFormat('#,##0.00'); } catch (e) {}
   }
 
-  // Нормализованный поиск
-  var targetNorms = {};
-  for (var j = 0; j < aliases.length; j++) {
-    targetNorms[normHeader_(aliases[j])] = true;
-  }
-
-  var keys = Object.keys(headerMap);
-  for (var k = 0; k < keys.length; k++) {
-    var key = keys[k];
-    if (targetNorms[normHeader_(key)]) return key;
-  }
-
-  return '';
+  return rowNum;
 }
 
-function setCellValue_(sh, row, headerName, value) {
-  var map = getHeaderMap_(sh);
-  var col = map[headerName];
-  if (!col) throw new Error('Не найдена колонка "' + headerName + '" в листе "' + sh.getName() + '".');
-  sh.getRange(row, col).setValue(value);
-}
+function findProdRequestDuplicate_(prodLogSheet, requestNo, driveFileId) {
+  const lastRow = prodLogSheet.getLastRow();
+  if (lastRow < 2) return null;
 
-function suggestProductionRequestNo_(kpNo) {
-  var tz = Session.getScriptTimeZone() || 'Asia/Yerevan';
-  var ts = Utilities.formatDate(new Date(), tz, 'yyyyMMdd-HHmm');
-  var kp = strv_(kpNo);
+  const lastCol = prodLogSheet.getLastColumn();
+  const headers = prodLogSheet.getRange(1, 1, 1, lastCol).getDisplayValues()[0].map(_normProdHeader_);
 
-  if (kp) return 'ЗП-' + kp + '-' + ts;
-  return 'ЗП-' + ts;
-}
+  const cReq = headers.indexOf(_normProdHeader_('Номер заявки на производство')) + 1;
+  const cId = headers.indexOf(_normProdHeader_('Drive File ID')) + 1;
+  if (!cReq || !cId) return null;
 
-function safeAutoResize_(sh, col, numCols) {
-  try {
-    sh.autoResizeColumns(col, numCols);
-  } catch (e) {}
-}
+  const n = lastRow - 1;
+  const reqVals = prodLogSheet.getRange(2, cReq, n, 1).getDisplayValues().map(r => String(r[0] || '').trim());
+  const idVals = prodLogSheet.getRange(2, cId, n, 1).getDisplayValues().map(r => String(r[0] || '').trim());
 
-function strv_(v) {
-  return String(v == null ? '' : v).trim();
-}
-
-function normText_(v) {
-  return strv_(v).replace(/\s+/g, ' ').toLowerCase();
-}
-
-function normHeader_(v) {
-  return normText_(v).replace(/\n+/g, ' ');
-}
-
-function pickAny_(obj, keys) {
-  if (!obj || typeof obj !== 'object') return '';
-  for (var i = 0; i < keys.length; i++) {
-    var k = keys[i];
-    if (Object.prototype.hasOwnProperty.call(obj, k) && obj[k] != null && obj[k] !== '') {
-      return obj[k];
+  for (let i = n - 1; i >= 0; i--) {
+    if (reqVals[i] === requestNo && idVals[i] === driveFileId) {
+      return { row: i + 2 };
     }
   }
-  return '';
+  return null;
 }
 
-function pickNumberByKeys_(obj, keys) {
-  var v = pickAny_(obj, keys);
-  return toNumberLoosePR_(v);
+/* ========================= Статусы в Журнал КП ========================= */
+
+function setKpLogStatusByRow_(kpLogSheet, row, statusValue) {
+  const statusCol = getKpLogStatusColumn_(kpLogSheet);
+  if (!statusCol) throw new Error('Не найдена колонка "Статус" в "Журнал КП".');
+  kpLogSheet.getRange(row, statusCol).setValue(statusValue);
 }
 
-function toNumberLoosePR_(v) {
-  if (v == null || v === '') return 0;
-  if (typeof v === 'number') return isNaN(v) ? 0 : v;
+function getKpLogStatusColumn_(kpLogSheet) {
+  const headers = kpLogSheet.getRange(1, 1, 1, kpLogSheet.getLastColumn()).getDisplayValues()[0];
+  const norm = headers.map(h => String(h || '').trim().toLowerCase());
+  return norm.indexOf('статус') + 1;
+}
 
-  var s = String(v).replace(/\s+/g, '').replace(',', '.');
-  var n = Number(s);
-  return isNaN(n) ? 0 : n;
+function findAnotherSentProductionByKpAndCustomer_(kpLogSheet, kpNo, customer, currentDriveFileId) {
+  const lastRow = kpLogSheet.getLastRow();
+  if (lastRow < 2) return null;
+
+  const headers = kpLogSheet.getRange(1, 1, 1, kpLogSheet.getLastColumn()).getDisplayValues()[0];
+  const norm = headers.map(h => String(h || '').trim().toLowerCase());
+
+  const cKp = norm.indexOf('кп №') + 1;
+  const cCust = norm.indexOf('заказчик') + 1;
+  const cStatus = norm.indexOf('статус') + 1;
+  const cDrive = norm.indexOf('drive file id') + 1;
+
+  if (!cKp || !cCust || !cStatus || !cDrive) return null;
+
+  const n = lastRow - 1;
+  const kpVals = kpLogSheet.getRange(2, cKp, n, 1).getDisplayValues().map(r => String(r[0] || '').trim());
+  const custVals = kpLogSheet.getRange(2, cCust, n, 1).getDisplayValues().map(r => String(r[0] || '').trim());
+  const statusVals = kpLogSheet.getRange(2, cStatus, n, 1).getDisplayValues().map(r => String(r[0] || '').trim());
+  const idVals = kpLogSheet.getRange(2, cDrive, n, 1).getDisplayValues().map(r => String(r[0] || '').trim());
+
+  for (let i = 0; i < n; i++) {
+    if (kpVals[i] !== kpNo) continue;
+    if (custVals[i] !== customer) continue;
+    if (idVals[i] === currentDriveFileId) continue;
+    if (statusVals[i] === 'Отправлена в производство') {
+      return { row: i + 2, driveFileId: idVals[i] };
+    }
+  }
+  return null;
+}
+
+function cancelDuplicateKpRows_(kpLogSheet, opts) {
+  const kpNo = String(opts.kpNo || '').trim();
+  const customer = String(opts.customer || '').trim();
+  const exceptDriveFileId = String(opts.exceptDriveFileId || '').trim();
+  const keepRow = Number(opts.keepRow || 0);
+
+  const lastRow = kpLogSheet.getLastRow();
+  if (lastRow < 2) return 0;
+
+  const headers = kpLogSheet.getRange(1, 1, 1, kpLogSheet.getLastColumn()).getDisplayValues()[0];
+  const norm = headers.map(h => String(h || '').trim().toLowerCase());
+
+  const cKp = norm.indexOf('кп №') + 1;
+  const cCust = norm.indexOf('заказчик') + 1;
+  const cStatus = norm.indexOf('статус') + 1;
+  const cDrive = norm.indexOf('drive file id') + 1;
+
+  if (!cKp || !cCust || !cStatus || !cDrive) return 0;
+
+  const n = lastRow - 1;
+  const vals = kpLogSheet.getRange(2, 1, n, kpLogSheet.getLastColumn()).getDisplayValues();
+
+  let changed = 0;
+  for (let i = 0; i < n; i++) {
+    const row = i + 2;
+    if (row === keepRow) continue;
+
+    const vKp = String(vals[i][cKp - 1] || '').trim();
+    const vCust = String(vals[i][cCust - 1] || '').trim();
+    const vDrive = String(vals[i][cDrive - 1] || '').trim();
+    const vStatus = String(vals[i][cStatus - 1] || '').trim();
+
+    if (vKp !== kpNo) continue;
+    if (vCust !== customer) continue;
+    if (!vDrive || vDrive === exceptDriveFileId) continue;
+
+    // Не трогаем уже отправленные (но обычно таких не будет из-за предварительной проверки)
+    if (vStatus === 'Отправлена в производство') continue;
+
+    kpLogSheet.getRange(row, cStatus).setValue('Аннулирована');
+    changed++;
+  }
+
+  return changed;
 }
