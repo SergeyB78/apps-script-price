@@ -1,15 +1,11 @@
-/**
+/** 
  * kp_log.gs — сбор данных для журнала КП и запись в лист "Журнал КП"
  *
- * ДОРАБОТКА (UID):
- * - extractCartAsJson_ добавляет uid в каждый объект позиции:
- *   { uid, art, name, ... }
- * - uid берётся из скрытой колонки "UID" (если есть),
- *   иначе можно (на будущее) расширить fallback-логикой.
- *
  * КЛЮЧЕВОЕ:
- * - appendToLog_() записывает строку ПО ЗАГОЛОВКАМ листа, чтобы значения не "съезжали".
+ * - appendToLog_() записывает строку ПО ЗАГОЛОВКАМ листа, чтобы значения не "съезжали"
+ *   при удалении/перестановке/скрытии столбцов (например Drive File ID).
  * - Автоформат денежных колонок: "#,##0.00"
+ * - Автостатус для новой записи в журнале КП: "Новая" (колонка "Статус")
  */
 
 /* ========================= Helpers / Safe wrappers ========================= */
@@ -24,26 +20,30 @@ function _normHeader_(s) {
 
 function _toNumberLoose_(v) {
   if (typeof toNumber_ === 'function') return toNumber_(v);
+
   if (v === null || v === undefined || v === '') return 0;
   if (typeof v === 'number') return v;
-  const s = String(v).replace(/\s+/g, '').replace(',', '.');
-  const n = Number(s);
+
+  var s = String(v).replace(/\s+/g, '').replace(',', '.');
+  var n = Number(s);
   return isNaN(n) ? 0 : n;
 }
 
 function _normalizePercentLoose_(v) {
   if (typeof normalizePercent_ === 'function') return normalizePercent_(v);
-  const n = _toNumberLoose_(v);
+
+  var n = _toNumberLoose_(v);
   if (!n) return 0;
-  return n > 1 ? n / 100 : n;
+  return n > 1 ? n / 100 : n; // 70 -> 0.7
 }
 
 function _safeFindValueByLabelInColD_(sh, label) {
   if (typeof findValueByLabelInColD_ === 'function') return findValueByLabelInColD_(sh, label);
 
-  const maxScan = Math.min(400, sh.getLastRow());
-  for (let r = 1; r <= maxScan; r++) {
-    const a = String(sh.getRange(r, 1).getDisplayValue() || '').trim();
+  // fallback: ищем подпись в A, значение в D
+  var maxScan = Math.min(400, sh.getLastRow());
+  for (var r = 1; r <= maxScan; r++) {
+    var a = String(sh.getRange(r, 1).getDisplayValue() || '').trim();
     if (a === label) return sh.getRange(r, 4).getValue();
   }
   return '';
@@ -52,9 +52,10 @@ function _safeFindValueByLabelInColD_(sh, label) {
 function _safeFindTermsValueRight_(sh, label) {
   if (typeof findTermsValueRight_ === 'function') return findTermsValueRight_(sh, label);
 
-  const maxScan = Math.min(700, sh.getLastRow());
-  for (let r = 1; r <= maxScan; r++) {
-    const a = String(sh.getRange(r, 1).getDisplayValue() || '').trim();
+  // fallback: ищем подпись в A, значение в J
+  var maxScan = Math.min(700, sh.getLastRow());
+  for (var r = 1; r <= maxScan; r++) {
+    var a = String(sh.getRange(r, 1).getDisplayValue() || '').trim();
     if (a === label) return sh.getRange(r, 10).getValue(); // J
   }
   return '';
@@ -62,134 +63,159 @@ function _safeFindTermsValueRight_(sh, label) {
 
 /* ========================= API used by controller ========================= */
 
+/**
+ * Мета-данные для журнала КП.
+ */
 function extractMetaForLog_(sh) {
-  const kpNo = String(_safeFindValueByLabelInColD_(sh, 'Коммерческое предложение №') || '').trim();
-  const kpDate = _safeFindValueByLabelInColD_(sh, 'Дата КП');
-  const manager = String(_safeFindValueByLabelInColD_(sh, 'Менеджер') || '').trim();
-  const phone = String(_safeFindValueByLabelInColD_(sh, 'Телефон') || '').trim();
-  const customer = String(_safeFindValueByLabelInColD_(sh, 'Наименование Заказчика') || '').trim();
-  const customerAddr = String(_safeFindValueByLabelInColD_(sh, 'Адрес Заказчика') || '').trim();
-  const contractNo = String(_safeFindValueByLabelInColD_(sh, '№ Договора') || '').trim();
+  var kpNo = String(_safeFindValueByLabelInColD_(sh, 'Коммерческое предложение №') || '').trim();
+  var kpDate = _safeFindValueByLabelInColD_(sh, 'Дата КП');
+  var manager = String(_safeFindValueByLabelInColD_(sh, 'Менеджер') || '').trim();
+  var phone = String(_safeFindValueByLabelInColD_(sh, 'Телефон') || '').trim();
+  var customer = String(_safeFindValueByLabelInColD_(sh, 'Наименование Заказчика') || '').trim();
+  var customerAddr = String(_safeFindValueByLabelInColD_(sh, 'Адрес Заказчика') || '').trim();
+  var contractNo = String(_safeFindValueByLabelInColD_(sh, '№ Договора') || '').trim();
 
-  const discountPct = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'Скидка (-) / Наценка (+), %'));
-  const installPct = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'Размер монтажа от стоимости оборудования, %'));
+  var discountPct = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'Скидка (-) / Наценка (+), %'));
+  var installPct = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'Размер монтажа от стоимости оборудования, %'));
 
-  let equipTotal = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'Итого за оборудование, руб'));
+  var equipTotal = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'Итого за оборудование, руб'));
   if (!equipTotal) equipTotal = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'Итого оборудование, руб'));
 
-  const installTotal = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'Монтаж, руб'));
-  const delivery = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'Доставка, руб'));
-  const toPay = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'Итого к оплате, руб'));
+  var installTotal = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'Монтаж, руб'));
+  var delivery = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'Доставка, руб'));
+  var toPay = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'Итого к оплате, руб'));
 
-  let vat = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'НДС 22%, руб'));
+  var vat = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'НДС 22%, руб'));
   if (!vat) vat = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'В том числе НДС 22%, руб'));
 
-  const prepayPctNorm = _normalizePercentLoose_(
+  var prepayPctNorm = _normalizePercentLoose_(
     _safeFindTermsValueRight_(sh, 'Предоплата за оборудование составляет:')
   );
 
-  let prepaySum = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'Сумма предоплаты, руб'));
+  var prepaySum = _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'Сумма предоплаты, руб'));
   if (!prepaySum && equipTotal && prepayPctNorm) prepaySum = equipTotal * prepayPctNorm;
 
-  const mainLead =
-    String(_safeFindTermsValueRight_(sh, 'Срок поставки Основное производство исчисляется с момента поступления предоплаты на р/счет и составляет:') || '').trim()
-    || String(_safeFindValueByLabelInColD_(sh, 'Срок (Основное)') || '').trim();
+  var mainLead =
+    String(
+      _safeFindTermsValueRight_(
+        sh,
+        'Срок поставки Основное производство исчисляется с момента поступления предоплаты на р/счет и составляет:'
+      ) || ''
+    ).trim() ||
+    String(_safeFindValueByLabelInColD_(sh, 'Срок (Основное)') || '').trim();
 
-  const ecoLead =
-    String(_safeFindTermsValueRight_(sh, 'Срок поставки ЭКО-серия исчисляется с момента поступления предоплаты на р/счет и составляет:') || '').trim()
-    || String(_safeFindValueByLabelInColD_(sh, 'Срок (ЭКО)') || '').trim();
+  var ecoLead =
+    String(
+      _safeFindTermsValueRight_(
+        sh,
+        'Срок поставки ЭКО-серия исчисляется с момента поступления предоплаты на р/счет и составляет:'
+      ) || ''
+    ).trim() ||
+    String(_safeFindValueByLabelInColD_(sh, 'Срок (ЭКО)') || '').trim();
 
-  const validDays =
-    _toNumberLoose_(_safeFindTermsValueRight_(sh, 'Данное КП действительно в течение:'))
-    || _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'КП действительно, дней'));
+  var validDays =
+    _toNumberLoose_(_safeFindTermsValueRight_(sh, 'Данное КП действительно в течение:')) ||
+    _toNumberLoose_(_safeFindValueByLabelInColD_(sh, 'КП действительно, дней'));
 
   return {
     timestamp: new Date(),
-    kpNo,
-    kpDate,
-    manager,
-    phone,
-    customer,
-    customerAddr,
-    contractNo,
-    discountPct,
-    installPct,
-    equipTotal,
-    installTotal,
-    delivery,
-    toPay,
-    vat,
-    prepayPctNorm,
-    prepaySum,
-    mainLead,
-    ecoLead,
-    validDays,
+    kpNo: kpNo,
+    kpDate: kpDate,
+    manager: manager,
+    phone: phone,
+    customer: customer,
+    customerAddr: customerAddr,
+    contractNo: contractNo,
+    discountPct: discountPct,
+    installPct: installPct,
+    equipTotal: equipTotal,
+    installTotal: installTotal,
+    delivery: delivery,
+    toPay: toPay,
+    vat: vat,
+    prepayPctNorm: prepayPctNorm,
+    prepaySum: prepaySum,
+    mainLead: mainLead,
+    ecoLead: ecoLead,
+    validDays: validDays
   };
 }
 
 /**
- * Корзина → JSON (включая Примечание и индивидуальную скидку, UID)
+ * Корзина → JSON (включая Примечание и индивидуальную скидку, если такие колонки есть).
  */
 function extractCartAsJson_(sh) {
-  const headerRow = _findCartHeaderRow_(sh, 'Артикул');
+  var headerRow = _findCartHeaderRow_(sh, 'Артикул');
   if (!headerRow) return { items: [], jsonString: '[]' };
 
-  const maxCol = Math.min(60, sh.getLastColumn());
-  const hdr = sh.getRange(headerRow, 1, 1, maxCol).getDisplayValues()[0].map(_normHeader_);
+  var maxCol = Math.min(40, sh.getLastColumn());
+  var hdr = sh.getRange(headerRow, 1, 1, maxCol).getDisplayValues()[0].map(_normHeader_);
 
-  const colUid = _colByName_(hdr, ['uid']) || 0;
-  const colArt = _colByName_(hdr, ['артикул']) || 1;
-  const colName = _colByName_(hdr, ['наименование']) || 4;
-  const colUnit = _colByName_(hdr, ['ед. изм.', 'ед.изм.', 'ед.']) || 5;
-  const colPrice = _colByName_(hdr, ['стоимость оборудования', 'цена', 'стоимость']) || 6;
-  const colQty = _colByName_(hdr, ['кол-во', 'количество']) || 7;
-  const colSumEquip = _colByName_(hdr, ['всего за оборудование', 'сумма за оборудование']) || 8;
-  const colInstallUnit = _colByName_(hdr, ['стоимость монтажа']) || 9;
-  const colSumInstall = _colByName_(hdr, ['всего за монтаж']) || 10;
-  const colTotal = _colByName_(hdr, ['итого']) || 11;
-  const colNote = _colByName_(hdr, ['примечание', 'комментарий']) || 0;
-  const colDiscount = _colByContainsAll_(hdr, ['скидка', '%']) || 0;
+  var colArt = _colByName_(hdr, ['артикул']) || 1;
+  var colName = _colByName_(hdr, ['наименование']) || 4;
+  var colUnit = _colByName_(hdr, ['ед. изм.', 'ед.изм.', 'ед.']) || 5;
+  var colPrice = _colByName_(hdr, ['стоимость оборудования', 'цена', 'стоимость']) || 6;
+  var colQty = _colByName_(hdr, ['кол-во', 'количество']) || 7;
+  var colSumEquip = _colByName_(hdr, ['всего за оборудование', 'сумма за оборудование']) || 8;
+  var colInstallUnit = _colByName_(hdr, ['стоимость монтажа']) || 9;
+  var colSumInstall = _colByName_(hdr, ['всего за монтаж']) || 10;
+  var colTotal = _colByName_(hdr, ['итого']) || 11;
 
-  const items = [];
-  const lastRow = sh.getLastRow();
+  var colNote = _colByName_(hdr, ['примечание', 'комментарий']) || 0;
+  var colDiscount = _colByContainsAll_(hdr, ['скидка', '%']) || 0;
 
-  for (let r = headerRow + 1; r <= lastRow; r++) {
-    const art = String(sh.getRange(r, colArt).getDisplayValue() || '').trim();
-    const name = String(sh.getRange(r, colName).getDisplayValue() || '').trim();
+  var items = [];
+  var lastRow = sh.getLastRow();
+
+  for (var r = headerRow + 1; r <= lastRow; r++) {
+    var art = String(sh.getRange(r, colArt).getDisplayValue() || '').trim();
+    var name = String(sh.getRange(r, colName).getDisplayValue() || '').trim();
 
     if (!art && !name) break;
     if (!art) continue;
 
-    const uid = colUid ? String(sh.getRange(r, colUid).getDisplayValue() || '').trim() : '';
+    var unit = String(sh.getRange(r, colUnit).getDisplayValue() || '').trim();
+    var price = _toNumberLoose_(sh.getRange(r, colPrice).getValue());
+    var qty = _toNumberLoose_(sh.getRange(r, colQty).getValue());
+    var sumEquip = _toNumberLoose_(sh.getRange(r, colSumEquip).getValue());
+    var installUnit = _toNumberLoose_(sh.getRange(r, colInstallUnit).getValue());
+    var sumInstall = _toNumberLoose_(sh.getRange(r, colSumInstall).getValue());
+    var total = _toNumberLoose_(sh.getRange(r, colTotal).getValue());
+    var note = colNote ? String(sh.getRange(r, colNote).getDisplayValue() || '').trim() : '';
+    var discountPct = colDiscount ? _toNumberLoose_(sh.getRange(r, colDiscount).getValue()) : '';
 
-    const unit = String(sh.getRange(r, colUnit).getDisplayValue() || '').trim();
-    const price = _toNumberLoose_(sh.getRange(r, colPrice).getValue());
-    const qty = _toNumberLoose_(sh.getRange(r, colQty).getValue());
-    const sumEquip = _toNumberLoose_(sh.getRange(r, colSumEquip).getValue());
-    const installUnit = _toNumberLoose_(sh.getRange(r, colInstallUnit).getValue());
-    const sumInstall = _toNumberLoose_(sh.getRange(r, colSumInstall).getValue());
-    const total = _toNumberLoose_(sh.getRange(r, colTotal).getValue());
-    const note = colNote ? String(sh.getRange(r, colNote).getDisplayValue() || '').trim() : '';
-    const discountPct = colDiscount ? _toNumberLoose_(sh.getRange(r, colDiscount).getValue()) : '';
-
-    items.push({ uid, art, name, unit, qty, price, sumEquip, installUnit, sumInstall, total, note, discountPct });
+    items.push({
+      art: art,
+      name: name,
+      unit: unit,
+      qty: qty,
+      price: price,
+      sumEquip: sumEquip,
+      installUnit: installUnit,
+      sumInstall: sumInstall,
+      total: total,
+      note: note,
+      discountPct: discountPct
+    });
   }
 
-  return { items, jsonString: JSON.stringify(items) };
+  return { items: items, jsonString: JSON.stringify(items) };
 }
 
 function buildPdfFileName_(meta) {
-  const safe = (s) => String(s || '')
-    .replace(/[\\\/:*?"<>|]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 80);
+  var safe = function (s) {
+    return String(s || '')
+      .replace(/[\\\/:*?"<>|]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 80);
+  };
 
-  const dateStr = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
-  const kpNo = safe(meta.kpNo);
-  const cust = safe(meta.customer);
+  var dateStr = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  var kpNo = safe(meta.kpNo);
+  var cust = safe(meta.customer);
 
-  let name = 'КП';
+  var name = 'КП';
   if (kpNo) name += '_' + kpNo;
   if (cust) name += '_' + cust;
   name += '_' + dateStr;
@@ -197,6 +223,9 @@ function buildPdfFileName_(meta) {
   return name;
 }
 
+/**
+ * Формирует массив значений в порядке KP_EXPORT_CFG.LOG_HEADERS.
+ */
 function buildLogRow_(meta, cartJson, fileUrl, downloadUrl, fileId) {
   return [
     meta.timestamp,
@@ -222,21 +251,27 @@ function buildLogRow_(meta, cartJson, fileUrl, downloadUrl, fileId) {
     cartJson,
     fileUrl,
     downloadUrl || '',
-    fileId,
+    fileId
+    // "Статус" не добавляем здесь: appendToLog_() заполнит автоматически
   ];
 }
 
 /**
- * Записывает строку в "Журнал КП" ПО ЗАГОЛОВКАМ листа.
+ * Запись в "Журнал КП" ПО ЗАГОЛОВКАМ листа
+ * + автозаполнение "Статус" = "Новая"
  */
 function appendToLog_(ss, rowValues) {
-  const cfgLogName =
-    (typeof KP_EXPORT_CFG !== 'undefined' && KP_EXPORT_CFG.LOG_SHEET) ? KP_EXPORT_CFG.LOG_SHEET : 'Журнал КП';
+  var cfgLogName =
+    (typeof KP_EXPORT_CFG !== 'undefined' && KP_EXPORT_CFG.LOG_SHEET)
+      ? KP_EXPORT_CFG.LOG_SHEET
+      : 'Журнал КП';
 
-  const cfgHeaders =
-    (typeof KP_EXPORT_CFG !== 'undefined' && KP_EXPORT_CFG.LOG_HEADERS) ? KP_EXPORT_CFG.LOG_HEADERS : null;
+  var cfgHeaders =
+    (typeof KP_EXPORT_CFG !== 'undefined' && KP_EXPORT_CFG.LOG_HEADERS)
+      ? KP_EXPORT_CFG.LOG_HEADERS
+      : null;
 
-  let log = ss.getSheetByName(cfgLogName);
+  var log = ss.getSheetByName(cfgLogName);
   if (!log) {
     log = ss.insertSheet(cfgLogName);
     if (cfgHeaders && cfgHeaders.length) {
@@ -250,70 +285,98 @@ function appendToLog_(ss, rowValues) {
     log.setFrozenRows(1);
   }
 
-  const lastCol = log.getLastColumn();
+  var lastCol = log.getLastColumn();
   if (lastCol < 1) throw new Error('Журнал КП: нет колонок (пустая шапка).');
 
-  const sheetHeadersRaw = log.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
-  const sheetHeadersNorm = sheetHeadersRaw.map(_normHeader_);
+  var sheetHeadersRaw = log.getRange(1, 1, 1, lastCol).getDisplayValues()[0];
+  var sheetHeadersNorm = sheetHeadersRaw.map(_normHeader_);
 
-  const colByNorm = {};
-  for (let c = 0; c < sheetHeadersNorm.length; c++) {
-    const h = sheetHeadersNorm[c];
+  // карта: нормЗаголовка -> индексКолонки (1-based)
+  var colByNorm = {};
+  for (var c = 0; c < sheetHeadersNorm.length; c++) {
+    var h = sheetHeadersNorm[c];
     if (h && !(h in colByNorm)) colByNorm[h] = c + 1;
   }
 
-  const valuesByNorm = {};
+  // значения: нормЗаголовка -> значение
+  var valuesByNorm = {};
 
   if (Array.isArray(rowValues)) {
-    const srcHeaders = (cfgHeaders && cfgHeaders.length) ? cfgHeaders : sheetHeadersRaw;
-    for (let i = 0; i < rowValues.length; i++) {
-      const hName = srcHeaders[i];
+    var srcHeaders = (cfgHeaders && cfgHeaders.length) ? cfgHeaders : sheetHeadersRaw;
+    for (var i = 0; i < rowValues.length; i++) {
+      var hName = srcHeaders[i];
       if (!hName) continue;
       valuesByNorm[_normHeader_(hName)] = rowValues[i];
     }
   } else if (rowValues && typeof rowValues === 'object') {
-    Object.keys(rowValues).forEach(k => {
+    Object.keys(rowValues).forEach(function (k) {
       valuesByNorm[_normHeader_(k)] = rowValues[k];
     });
   }
 
-  const rowOut = sheetHeadersNorm.map(hn => (hn in valuesByNorm ? valuesByNorm[hn] : ''));
-  const nextRow = Math.max(2, log.getLastRow() + 1);
+  // собираем rowOut под текущую шапку листа
+  var rowOut = sheetHeadersNorm.map(function (hn) {
+    return (hn in valuesByNorm ? valuesByNorm[hn] : '');
+  });
 
+  var nextRow = Math.max(2, log.getLastRow() + 1);
   log.getRange(nextRow, 1, 1, rowOut.length).setValues([rowOut]);
 
+  // ✅ Автостатус: "Новая" в колонке "Статус" (или fallback "Статус КП")
   try {
-    const cTime = colByNorm[_normHeader_('Дата/время выгрузки')] || 1;
+    var statusDefault = 'Новая';
+
+    var cStatus =
+      colByNorm[_normHeader_('Статус')] ||
+      colByNorm[_normHeader_('Статус КП')];
+
+    if (cStatus) {
+      var cell = log.getRange(nextRow, cStatus);
+      var cur = String(cell.getDisplayValue() || '').trim();
+      if (!cur) cell.setValue(statusDefault);
+    }
+  } catch (e) {}
+
+  // формат времени (по заголовку "Дата/время выгрузки" если есть, иначе колонка 1)
+  try {
+    var cTime = colByNorm[_normHeader_('Дата/время выгрузки')] || 1;
     log.getRange(nextRow, cTime).setNumberFormat('dd.MM.yyyy HH:mm:ss');
   } catch (e) {}
 
-  try { applyMoneyFormatsInLog_(log); } catch (e) {}
+  // ✅ автоформат денег
+  try {
+    applyMoneyFormatsInLog_(log);
+  } catch (e) {}
 }
 
+/**
+ * Ставит "#,##0.00" на денежные колонки по заголовкам.
+ */
 function applyMoneyFormatsInLog_(logSheet) {
-  const lastRow = logSheet.getLastRow();
+  var lastRow = logSheet.getLastRow();
   if (lastRow < 2) return;
 
-  const lastCol = logSheet.getLastColumn();
+  var lastCol = logSheet.getLastColumn();
   if (lastCol < 1) return;
 
-  const headers = logSheet.getRange(1, 1, 1, lastCol).getDisplayValues()[0].map(_normHeader_);
+  var headers = logSheet.getRange(1, 1, 1, lastCol).getDisplayValues()[0].map(_normHeader_);
 
-  const moneyHeaders = [
+  var moneyHeaders = [
     'Итого оборудование, руб',
     'Монтаж, руб',
     'Доставка, руб',
     'Итого к оплате, руб',
     'Сумма предоплаты, руб',
-    'НДС 22%, руб',
+    'НДС 22%, руб'
   ].map(_normHeader_);
 
-  const fmtMoney = '#,##0.00';
+  var fmtMoney = '#,##0.00';
 
-  for (const h of moneyHeaders) {
-    const idx = headers.indexOf(h);
+  for (var i = 0; i < moneyHeaders.length; i++) {
+    var h = moneyHeaders[i];
+    var idx = headers.indexOf(h);
     if (idx === -1) continue;
-    const col = idx + 1;
+    var col = idx + 1;
     logSheet.getRange(2, col, lastRow - 1, 1).setNumberFormat(fmtMoney);
   }
 }
@@ -321,31 +384,40 @@ function applyMoneyFormatsInLog_(logSheet) {
 /* ========================= Cart header helpers ========================= */
 
 function _findCartHeaderRow_(sh, anchorText) {
-  const anchor = _normHeader_(anchorText);
-  const last = Math.min(800, sh.getLastRow());
+  var anchor = _normHeader_(anchorText);
+  var last = Math.min(800, sh.getLastRow());
 
-  for (let r = 1; r <= last; r++) {
-    const v = _normHeader_(sh.getRange(r, 1).getDisplayValue());
+  for (var r = 1; r <= last; r++) {
+    var v = _normHeader_(sh.getRange(r, 1).getDisplayValue());
     if (v === anchor) return r;
   }
   return 0;
 }
 
 function _colByName_(hdrNorm, variants) {
-  for (const v of variants) {
-    const vn = _normHeader_(v);
-    const idx = hdrNorm.indexOf(vn);
+  for (var i = 0; i < variants.length; i++) {
+    var vn = _normHeader_(variants[i]);
+    var idx = hdrNorm.indexOf(vn);
     if (idx >= 0) return idx + 1;
   }
   return 0;
 }
 
 function _colByContainsAll_(hdrNorm, parts) {
-  const p = parts.map(_normHeader_);
-  for (let i = 0; i < hdrNorm.length; i++) {
-    const t = hdrNorm[i];
+  var p = parts.map(_normHeader_);
+
+  for (var i = 0; i < hdrNorm.length; i++) {
+    var t = hdrNorm[i];
     if (!t) continue;
-    if (p.every(x => t.includes(x))) return i + 1;
+
+    var ok = true;
+    for (var j = 0; j < p.length; j++) {
+      if (t.indexOf(p[j]) === -1) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return i + 1;
   }
   return 0;
 }

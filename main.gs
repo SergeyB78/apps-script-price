@@ -5,6 +5,8 @@ function onOpen() {
     .addItem("Сформировать прайс", "buildPriceSheetWithOutlines")
     .addSeparator()
     .addItem("Сформировать КП", "buildKP")
-    .addItem("Экспорт КП в PDF", "exportKpPdfAndLog") // <-- новый пункт
+    .addItem("Экспорт КП в PDF", "exportKpPdfAndLog")
+    .addSeparator()
+    .addItem("Создать заявку на производство (по строке Журнала КП)", "createProductionOrderFromSelectedKp")
     .addToUi();
 }
