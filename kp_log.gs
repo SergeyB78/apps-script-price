@@ -1,10 +1,11 @@
 /**
  * kp_log.gs — сбор данных для журнала КП и запись в лист "Журнал КП"
  *
- * Основное:
- * - appendToLog_() пишет ПО ЗАГОЛОВКАМ, а не "слева направо"
- * - ensureKpLogSchema_() гарантирует наличие колонки "Статус"
- * - Для новых записей статус = "Новая" + выпадающий список
+ * ИСПРАВЛЕНО:
+ * - buildLogRow_() теперь возвращает OBJECT по именам полей, а не массив
+ * - appendToLog_() пишет по заголовкам листа, с поддержкой алиасов заголовков
+ * - убран риск смещения данных, если CFG.SCHEMAS.KP_LOG и реальная шапка листа разошлись
+ * - ensureKpLogSchema_() гарантирует наличие полной схемы журнала и колонки "Статус"
  */
 
 /* ========================= Helpers / Safe wrappers ========================= */
@@ -85,26 +86,99 @@ function _colByContainsAll_(hdrNorm, parts) {
 }
 
 function _kpLogSheetName_() {
-  return (typeof CFG !== 'undefined' && CFG.SHEETS && CFG.SHEETS.KP_LOG) ? CFG.SHEETS.KP_LOG : 'Журнал КП';
+  return (typeof CFG !== 'undefined' && CFG.SHEETS && CFG.SHEETS.KP_LOG)
+    ? CFG.SHEETS.KP_LOG
+    : 'Журнал КП';
 }
 
-function _getKpLogHeadersCfg_() {
-  // Приоритет: CFG.SCHEMAS.KP_LOG
+/**
+ * Каноническая схема журнала КП.
+ * Даже если CFG устарел или в нём нет одного из заголовков,
+ * используем полный безопасный fallback.
+ */
+function _getKpLogHeadersCanonical_() {
+  const fallback = [
+    'Дата/время выгрузки',
+    'КП №',
+    'Дата КП',
+    'Менеджер',
+    'Телефон',
+    'Заказчик',
+    'Адрес заказчика',
+    '№ договора',
+    'Скидка (-) / Наценка (+), %',
+    'Размер монтажа от стоимости оборудования, %',
+    'Итого оборудование, руб',
+    'Монтаж, руб',
+    'Доставка, руб',
+    'Итого к оплате, руб',
+    'НДС 22%, руб',
+    'Предоплата, %',
+    'Сумма предоплаты, руб',
+    'Срок (Основное)',
+    'Срок (ЭКО)',
+    'КП действительно, дней',
+    'Позиции (JSON)',
+    'PDF URL (Drive)',
+    'PDF Download URL',
+    'Drive File ID',
+    'Статус'
+  ];
+
+  let fromCfg = null;
+
   if (typeof CFG !== 'undefined' && CFG.SCHEMAS && Array.isArray(CFG.SCHEMAS.KP_LOG) && CFG.SCHEMAS.KP_LOG.length) {
-    return CFG.SCHEMAS.KP_LOG.slice();
+    fromCfg = CFG.SCHEMAS.KP_LOG.slice();
+  } else if (typeof CFG !== 'undefined' && CFG.KP_EXPORT && Array.isArray(CFG.KP_EXPORT.LOG_HEADERS) && CFG.KP_EXPORT.LOG_HEADERS.length) {
+    fromCfg = CFG.KP_EXPORT.LOG_HEADERS.slice();
+  } else if (typeof KP_EXPORT_CFG !== 'undefined' && Array.isArray(KP_EXPORT_CFG.LOG_HEADERS) && KP_EXPORT_CFG.LOG_HEADERS.length) {
+    fromCfg = KP_EXPORT_CFG.LOG_HEADERS.slice();
   }
 
-  // fallback на старый KP_EXPORT_CFG.LOG_HEADERS
-  let headers = [];
-  if (typeof CFG !== 'undefined' && CFG.KP_EXPORT && Array.isArray(CFG.KP_EXPORT.LOG_HEADERS)) {
-    headers = CFG.KP_EXPORT.LOG_HEADERS.slice();
-  } else if (typeof KP_EXPORT_CFG !== 'undefined' && Array.isArray(KP_EXPORT_CFG.LOG_HEADERS)) {
-    headers = KP_EXPORT_CFG.LOG_HEADERS.slice();
+  if (!Array.isArray(fromCfg) || !fromCfg.length) return fallback.slice();
+
+  const fromCfgNorm = fromCfg.map(_normHeader_);
+  const fallbackNorm = fallback.map(_normHeader_);
+
+  const missing = fallbackNorm.filter(h => fromCfgNorm.indexOf(h) < 0);
+  if (missing.length) return fallback.slice();
+
+  return fromCfg.slice();
+}
+
+/**
+ * Алиасы заголовков -> канонический заголовок.
+ * Нужны для совместимости со старыми версиями шапки листа.
+ */
+function _getKpLogHeaderAliases_() {
+  const map = {};
+
+  function addAlias(aliasHeader, canonicalHeader) {
+    map[_normHeader_(aliasHeader)] = _normHeader_(canonicalHeader);
   }
 
-  // гарантируем Статус
-  if (headers.indexOf('Статус') < 0) headers.push('Статус');
-  return headers;
+  // Канонические заголовки сами на себя
+  _getKpLogHeadersCanonical_().forEach(function (h) {
+    map[_normHeader_(h)] = _normHeader_(h);
+  });
+
+  // Старые / альтернативные варианты
+  addAlias('Итого за оборудование, руб', 'Итого оборудование, руб');
+  addAlias('В том числе НДС 22%, руб', 'НДС 22%, руб');
+  addAlias('PDF URL', 'PDF URL (Drive)');
+  addAlias('PDF Download', 'PDF Download URL');
+  addAlias('Адрес Заказчика', 'Адрес заказчика');
+  addAlias('Срок поставки (Основное)', 'Срок (Основное)');
+  addAlias('Срок поставки (ЭКО)', 'Срок (ЭКО)');
+  addAlias('КП действительно', 'КП действительно, дней');
+
+  return map;
+}
+
+function _canonicalNormHeader_(header) {
+  const aliases = _getKpLogHeaderAliases_();
+  const norm = _normHeader_(header);
+  return aliases[norm] || norm;
 }
 
 function _getKpStatusList_() {
@@ -162,25 +236,25 @@ function extractMetaForLog_(sh) {
 
   return {
     timestamp: new Date(),
-    kpNo,
-    kpDate,
-    manager,
-    phone,
-    customer,
-    customerAddr,
-    contractNo,
-    discountPct,
-    installPct,
-    equipTotal,
-    installTotal,
-    delivery,
-    toPay,
-    vat,
-    prepayPctNorm,
-    prepaySum,
-    mainLead,
-    ecoLead,
-    validDays
+    kpNo: kpNo,
+    kpDate: kpDate,
+    manager: manager,
+    phone: phone,
+    customer: customer,
+    customerAddr: customerAddr,
+    contractNo: contractNo,
+    discountPct: discountPct,
+    installPct: installPct,
+    equipTotal: equipTotal,
+    installTotal: installTotal,
+    delivery: delivery,
+    toPay: toPay,
+    vat: vat,
+    prepayPctNorm: prepayPctNorm,
+    prepaySum: prepaySum,
+    mainLead: mainLead,
+    ecoLead: ecoLead,
+    validDays: validDays
   };
 }
 
@@ -241,29 +315,31 @@ function extractCartAsJson_(sh) {
 
     items.push({
       uid: uid || '',
-      art,
-      name,
-      unit,
-      qty,
-      price,
-      sumEquip,
-      installUnit,
-      sumInstall,
-      total,
-      note,
-      discountPct
+      art: art,
+      name: name,
+      unit: unit,
+      qty: qty,
+      price: price,
+      sumEquip: sumEquip,
+      installUnit: installUnit,
+      sumInstall: sumInstall,
+      total: total,
+      note: note,
+      discountPct: discountPct
     });
   }
 
-  return { items, jsonString: JSON.stringify(items) };
+  return { items: items, jsonString: JSON.stringify(items) };
 }
 
 function buildPdfFileName_(meta) {
-  const safe = (s) => String(s || '')
-    .replace(/[\\\/:*?"<>|]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 80);
+  const safe = function (s) {
+    return String(s || '')
+      .replace(/[\\\/:*?"<>|]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 80);
+  };
 
   const dateStr = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
   const kpNo = safe(meta.kpNo);
@@ -278,71 +354,82 @@ function buildPdfFileName_(meta) {
 }
 
 /**
- * Массив значений в порядке заголовков журнала (без жёсткой привязки к позициям колонок).
+ * ВАЖНО:
+ * Возвращаем ОБЪЕКТ по именам полей, а не массив.
+ * Это убирает риск смещения, если схема заголовков листа и конфига разошлась.
  */
 function buildLogRow_(meta, cartJson, fileUrl, downloadUrl, fileId) {
-  return [
-    meta.timestamp,                                    // Дата/время выгрузки
-    meta.kpNo,                                         // КП №
-    meta.kpDate || '',                                 // Дата КП
-    meta.manager,                                      // Менеджер
-    meta.phone,                                        // Телефон
-    meta.customer,                                     // Заказчик
-    meta.customerAddr,                                 // Адрес заказчика
-    meta.contractNo,                                   // № договора
-    meta.discountPct,                                  // Скидка %
-    meta.installPct,                                   // Монтаж %
-    meta.equipTotal,                                   // Итого оборудование
-    meta.installTotal,                                 // Монтаж
-    meta.delivery,                                     // Доставка
-    meta.toPay,                                        // Итого к оплате
-    meta.vat,                                          // НДС
-    meta.prepayPctNorm ? (meta.prepayPctNorm * 100) : '', // Предоплата %
-    meta.prepaySum,                                    // Сумма предоплаты
-    meta.mainLead,                                     // Срок (Основное)
-    meta.ecoLead,                                      // Срок (ЭКО)
-    meta.validDays,                                    // КП действительно
-    cartJson,                                          // Позиции (JSON)
-    fileUrl,                                           // PDF URL
-    downloadUrl || '',                                 // PDF Download URL
-    fileId || '',                                      // Drive File ID
-    'Новая'                                            // Статус (новый)
-  ];
+  return {
+    'Дата/время выгрузки': meta.timestamp,
+    'КП №': meta.kpNo,
+    'Дата КП': meta.kpDate || '',
+    'Менеджер': meta.manager,
+    'Телефон': meta.phone,
+    'Заказчик': meta.customer,
+    'Адрес заказчика': meta.customerAddr,
+    '№ договора': meta.contractNo,
+    'Скидка (-) / Наценка (+), %': meta.discountPct,
+    'Размер монтажа от стоимости оборудования, %': meta.installPct,
+    'Итого оборудование, руб': meta.equipTotal,
+    'Монтаж, руб': meta.installTotal,
+    'Доставка, руб': meta.delivery,
+    'Итого к оплате, руб': meta.toPay,
+    'НДС 22%, руб': meta.vat,
+    'Предоплата, %': meta.prepayPctNorm ? (meta.prepayPctNorm * 100) : '',
+    'Сумма предоплаты, руб': meta.prepaySum,
+    'Срок (Основное)': meta.mainLead,
+    'Срок (ЭКО)': meta.ecoLead,
+    'КП действительно, дней': meta.validDays,
+    'Позиции (JSON)': cartJson,
+    'PDF URL (Drive)': fileUrl,
+    'PDF Download URL': downloadUrl || '',
+    'Drive File ID': fileId || '',
+    'Статус': 'Новая'
+  };
 }
 
 /**
  * КРИТИЧЕСКОЕ:
- * Пишем строку ПО ЗАГОЛОВКАМ листа, чтобы значения не съезжали.
+ * Пишем строку ПО ЗАГОЛОВКАМ листа, а не "слева направо".
+ * Поддерживается и object-based, и array-based режим.
  */
 function appendToLog_(ss, rowArrayOrObject) {
   const sh = ensureKpLogSchema_(ss);
   const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getDisplayValues()[0];
   const normHeaders = headers.map(_normHeader_);
 
-  // Конфигурируемые заголовки "эталона"
-  const cfgHeaders = _getKpLogHeadersCfg_();
+  const aliases = _getKpLogHeaderAliases_();
+  const canonicalHeaders = _getKpLogHeadersCanonical_();
 
-  // Нормализованный словарь значений
+  // Нормализованный словарь значений: canonicalNormHeader -> value
   const valueMap = {};
 
   if (Array.isArray(rowArrayOrObject)) {
-    // Маппим массив по cfgHeaders
-    for (let i = 0; i < cfgHeaders.length; i++) {
-      valueMap[_normHeader_(cfgHeaders[i])] = (i < rowArrayOrObject.length) ? rowArrayOrObject[i] : '';
+    // fallback для старых вызовов, если где-то ещё остался массив
+    const srcHeaders = canonicalHeaders;
+    for (let i = 0; i < srcHeaders.length; i++) {
+      const hNorm = _canonicalNormHeader_(srcHeaders[i]);
+      valueMap[hNorm] = (i < rowArrayOrObject.length) ? rowArrayOrObject[i] : '';
     }
   } else {
     const obj = rowArrayOrObject || {};
-    Object.keys(obj).forEach(k => valueMap[_normHeader_(k)] = obj[k]);
+    Object.keys(obj).forEach(function (k) {
+      const hNorm = _canonicalNormHeader_(k);
+      valueMap[hNorm] = obj[k];
+    });
   }
 
   // Гарантия статуса по умолчанию
-  const statusKey = _normHeader_('Статус');
+  const statusKey = _canonicalNormHeader_('Статус');
   if (!String(valueMap[statusKey] || '').trim()) {
     valueMap[statusKey] = 'Новая';
   }
 
   // Собираем строку в реальном порядке заголовков листа
-  const row = normHeaders.map(h => (h in valueMap) ? valueMap[h] : '');
+  const row = normHeaders.map(function (sheetHeaderNorm) {
+    const canonicalSheetHeaderNorm = aliases[sheetHeaderNorm] || sheetHeaderNorm;
+    return (canonicalSheetHeaderNorm in valueMap) ? valueMap[canonicalSheetHeaderNorm] : '';
+  });
 
   sh.appendRow(row);
   const rowNum = sh.getLastRow();
@@ -355,13 +442,22 @@ function appendToLog_(ss, rowArrayOrObject) {
     'Итого к оплате, руб',
     'НДС 22%, руб',
     'Сумма предоплаты, руб'
-  ].map(_normHeader_);
+  ].map(_canonicalNormHeader_);
 
   for (let c = 1; c <= normHeaders.length; c++) {
-    if (moneyNames.indexOf(normHeaders[c - 1]) >= 0) {
-      try { sh.getRange(rowNum, c).setNumberFormat('#,##0.00'); } catch (e) {}
+    const canonicalHeader = aliases[normHeaders[c - 1]] || normHeaders[c - 1];
+    if (moneyNames.indexOf(canonicalHeader) >= 0) {
+      try {
+        sh.getRange(rowNum, c).setNumberFormat('#,##0.00');
+      } catch (e) {}
     }
   }
+
+  // Формат даты/времени
+  try {
+    const timeCol = normHeaders.indexOf(_normHeader_('Дата/время выгрузки')) + 1;
+    if (timeCol > 0) sh.getRange(rowNum, timeCol).setNumberFormat('dd.MM.yyyy HH:mm:ss');
+  } catch (e) {}
 
   // Валидация статуса на новой строке
   ensureKpLogStatusValidation_(sh);
@@ -376,39 +472,44 @@ function ensureKpLogSchema_(ss) {
   let sh = ss.getSheetByName(shName);
   if (!sh) sh = ss.insertSheet(shName);
 
-  const needHeaders = _getKpLogHeadersCfg_();
+  const needHeaders = _getKpLogHeadersCanonical_();
   if (!needHeaders.length) throw new Error('Не определены заголовки для "Журнал КП".');
 
-  const lastCol = Math.max(sh.getLastColumn(), 1);
-  const currentHeaders = sh.getLastRow() >= 1
-    ? sh.getRange(1, 1, 1, lastCol).getDisplayValues()[0]
+  const hasHeaderRow = sh.getLastRow() >= 1;
+  const currentHeaders = hasHeaderRow
+    ? sh.getRange(1, 1, 1, Math.max(sh.getLastColumn(), 1)).getDisplayValues()[0]
     : [];
 
-  const currentNorm = currentHeaders.map(_normHeader_);
-  const needNorm = needHeaders.map(_normHeader_);
+  const currentNorm = currentHeaders.map(_canonicalNormHeader_);
+  const needNorm = needHeaders.map(_canonicalNormHeader_);
 
   // Если шапки нет вообще — пишем целиком
-  if (currentHeaders.join('').trim() === '') {
+  if (!hasHeaderRow || currentHeaders.join('').trim() === '') {
     sh.getRange(1, 1, 1, needHeaders.length).setValues([needHeaders]);
+    sh.setFrozenRows(1);
   } else {
     // Добавляем недостающие колонки справа
-    needHeaders.forEach((h, i) => {
+    needHeaders.forEach(function (h, i) {
       if (currentNorm.indexOf(needNorm[i]) < 0) {
         sh.insertColumnAfter(sh.getLastColumn());
         sh.getRange(1, sh.getLastColumn()).setValue(h);
       }
     });
-  }
 
-  // Повторно читаем шапку
-  const finalHeaders = sh.getRange(1, 1, 1, sh.getLastColumn()).getDisplayValues()[0];
-  const finalNorm = finalHeaders.map(_normHeader_);
+    // Если заголовок совпадает по смыслу, но написан по-старому — нормализуем название
+    const finalHeadersTmp = sh.getRange(1, 1, 1, sh.getLastColumn()).getDisplayValues()[0];
+    const finalNormTmp = finalHeadersTmp.map(_canonicalNormHeader_);
 
-  // Приведём названия (если совпали по смыслу, но пусто/криво) — не трогаем порядок, только гарантируем "Статус"
-  const statusIdx = finalNorm.indexOf(_normHeader_('Статус')) + 1;
-  if (!statusIdx) {
-    sh.insertColumnAfter(sh.getLastColumn());
-    sh.getRange(1, sh.getLastColumn()).setValue('Статус');
+    for (let i = 0; i < finalHeadersTmp.length; i++) {
+      const hNorm = finalNormTmp[i];
+      const canonicalIdx = needNorm.indexOf(hNorm);
+      if (canonicalIdx >= 0) {
+        const canonicalTitle = needHeaders[canonicalIdx];
+        if (String(finalHeadersTmp[i] || '').trim() !== canonicalTitle) {
+          sh.getRange(1, i + 1).setValue(canonicalTitle);
+        }
+      }
+    }
   }
 
   ensureKpLogStatusValidation_(sh);
@@ -417,8 +518,9 @@ function ensureKpLogSchema_(ss) {
 
 function ensureKpLogStatusValidation_(sh) {
   if (!sh) return;
-  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getDisplayValues()[0].map(_normHeader_);
-  const statusCol = headers.indexOf(_normHeader_('Статус')) + 1;
+
+  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getDisplayValues()[0].map(_canonicalNormHeader_);
+  const statusCol = headers.indexOf(_canonicalNormHeader_('Статус')) + 1;
   if (!statusCol) return;
 
   const statuses = _getKpStatusList_();
@@ -438,12 +540,14 @@ function ensureKpLogStatusValidation_(sh) {
     const rng = sh.getRange(2, statusCol, lastRow - 1, 1);
     const vals = rng.getValues();
     let changed = false;
+
     for (let i = 0; i < vals.length; i++) {
       if (!String(vals[i][0] || '').trim()) {
         vals[i][0] = 'Новая';
         changed = true;
       }
     }
+
     if (changed) rng.setValues(vals);
   }
 }

@@ -7,6 +7,9 @@ function onOpen() {
     .addItem("Сформировать КП", "buildKP")
     .addItem("Экспорт КП в PDF", "exportKpPdfAndLog")
     .addSeparator()
-    .addItem("Создать заявку на производство (по строке Журнала КП)", "createProductionOrderFromSelectedKp")
+    .addItem(
+      "Создать заявку на производство (по строке Журнала КП)",
+      "createProductionRequestFromSelectedKp"
+    )
     .addToUi();
 }
