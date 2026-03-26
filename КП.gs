@@ -68,7 +68,11 @@ const KP_CFG = {
 
 /* ========================= ENTRY POINT (меню) ========================= */
 
-function buildKP() {
+function buildKP(options) {
+  options = options || {};
+  const skipConfirm = options.skipConfirm === true;
+  const mode = options.mode || '';
+
   const ss = SpreadsheetApp.getActive();
   const ui = SpreadsheetApp.getUi();
 
@@ -86,7 +90,19 @@ function buildKP() {
     return;
   }
 
-  // 2) Диалог выбора режима
+  // Для служебных вызовов (например, восстановление КП из журнала)
+  if (skipConfirm) {
+    if (mode === 'update') {
+      kp_buildKP_update_();
+      return;
+    }
+
+    // По умолчанию при служебном вызове — полная пересборка
+    kp_buildKP_reset_();
+    return;
+  }
+
+  // 2) Диалог выбора режима для обычного ручного запуска
   const msg =
     'Выберите режим формирования КП:\n\n' +
     'ДА — сформировать заново с полной очисткой листа «КП» (все данные, введённые вручную, будут удалены).\n\n' +
