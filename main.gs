@@ -6,6 +6,7 @@ function onOpen() {
     .addSeparator()
     .addItem("Сформировать КП", "buildKP")
     .addItem("Экспорт КП в PDF", "exportKpPdfAndLog")
+    .addItem('Восстановить КП из журнала', 'restoreKPFromJournal')
     .addSeparator()
     .addItem(
       "Создать заявку на производство (по строке Журнала КП)",

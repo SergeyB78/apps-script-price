@@ -2,8 +2,7 @@
  * КП pdf.gs (контроллер экспорта КП в PDF + запись в Журнал КП)
  *
  * ВАЖНО:
- * - НЕ объявляем глобальный const KP_EXPORT_CFG (чтобы не ловить
- *   SyntaxError: Identifier 'KP_EXPORT_CFG' has already been declared)
+ * - НЕ объявляем глобальный const KP_EXPORT_CFG
  * - Структуру "Журнал КП" обеспечивает kp_log.gs (ensureKpLogSchema_)
  * - Экспорт PDF/Drive/UI — kp_pdf_export.gs
  */
@@ -15,7 +14,7 @@ function exportKpPdfAndLog() {
   const sh = ss.getSheetByName(cfg.KP_SHEET);
   if (!sh) throw new Error('Не найден лист "' + cfg.KP_SHEET + '".');
 
-  // 1) Проверка обязательных полей (если есть функция в kp_pdf_export.gs)
+  // 1) Проверка обязательных полей
   if (typeof validateRequiredKpFields_ === 'function') {
     const missing = validateRequiredKpFields_(sh) || [];
     if (missing.length) {
@@ -26,7 +25,7 @@ function exportKpPdfAndLog() {
     }
   }
 
-  // 2) Готовим/проверяем структуру Журнала КП (включая колонку Статус)
+  // 2) Готовим/проверяем структуру Журнала КП
   if (typeof ensureKpLogSchema_ === 'function') {
     ensureKpLogSchema_(ss);
   }
@@ -44,7 +43,7 @@ function exportKpPdfAndLog() {
     return;
   }
 
-  // 4) Проверка дубля (по условиям + примечаниям)
+  // 4) Проверка дубля (по условиям + только примечаниям)
   const notesSig = notesSignatureFromCartJson_(cart && cart.jsonString ? cart.jsonString : '[]');
   const dup = findDuplicateInLogExt_(ss, meta, notesSig);
   if (dup && dup.found) {
@@ -88,6 +87,9 @@ function exportKpPdfAndLog() {
       ? hideDiscountColumnForPdf_(sh)
       : hideDiscountColumnForPdfSafe_(sh);
 
+    SpreadsheetApp.flush();
+    Utilities.sleep(300);
+
     // 6) PDF
     if (typeof exportSheetToPdfBlob_ !== 'function' || typeof savePdfToDriveFolder_ !== 'function') {
       throw new Error('Не найдены функции экспорта PDF (kp_pdf_export.gs).');
@@ -98,7 +100,7 @@ function exportKpPdfAndLog() {
 
     // 7) Журнал КП
     const logRow = buildLogRow_(meta, cart.jsonString, saved.fileUrl, saved.downloadUrl, saved.fileId);
-    appendToLog_(ss, logRow); // kp_log.gs сам положит по заголовкам + статус "Новая"
+    appendToLog_(ss, logRow);
 
     // 8) Диалог со ссылками
     if (typeof showLinksDialog_ === 'function') {
@@ -131,13 +133,15 @@ function exportKpPdfAndLog() {
 }
 
 /* ====================================================================== */
-/* Конфиг (без глобального KP_EXPORT_CFG)                                 */
+/* Конфиг                                                                 */
 /* ====================================================================== */
 
 function getKpExportCfg_() {
   const sheets = (typeof CFG !== 'undefined' && CFG.SHEETS) ? CFG.SHEETS : {};
   const ids = (typeof CFG !== 'undefined' && CFG.IDS) ? CFG.IDS : {};
-  const kpExport = (typeof CFG !== 'undefined' && (CFG.KP_EXPORT || CFG.KP_PDF)) ? (CFG.KP_EXPORT || CFG.KP_PDF) : {};
+  const kpExport = (typeof CFG !== 'undefined' && (CFG.KP_EXPORT || CFG.KP_PDF))
+    ? (CFG.KP_EXPORT || CFG.KP_PDF)
+    : {};
 
   return {
     KP_SHEET: sheets.KP || 'КП',
@@ -145,7 +149,7 @@ function getKpExportCfg_() {
     DRIVE_FOLDER_ID: kpExport.DRIVE_FOLDER_ID || ids.KP_PDF_FOLDER_ID || ids.DRIVE_FOLDER_ID || '',
     EXCLUDE_BLOCK_TITLES: {
       SETTINGS: (kpExport.EXCLUDE_BLOCK_TITLES && kpExport.EXCLUDE_BLOCK_TITLES.SETTINGS) || 'Настройки расчёта',
-      TERMS: (kpExport.EXCLUDE_BLOCK_TITLES && kpExport.EXCLUDE_BLOCK_TITLES.TERMS) || 'Условия и сроки поставки (изменяемые)',
+      TERMS: (kpExport.EXCLUDE_BLOCK_TITLES && kpExport.EXCLUDE_BLOCK_TITLES.TERMS) || 'Условия и сроки поставки (изменяемые)'
     },
     SETTINGS_ROWS_AFTER_TITLE: kpExport.SETTINGS_ROWS_AFTER_TITLE || 3,
     TERMS_ROWS_AFTER_TITLE: kpExport.TERMS_ROWS_AFTER_TITLE || 4,
@@ -282,35 +286,85 @@ function showDuplicateDialogExt_(dup) {
 }
 
 /* ====================================================================== */
-/* Fallback скрытия колонки скидки                                         */
+/* Скрытие / восстановление колонки скидки                                 */
 /* ====================================================================== */
 
 function hideDiscountColumnForPdfSafe_(sh) {
   const state = { wasHidden: false, col: 0 };
 
+  const candidates = [];
+
+  // 1. Пытаемся найти по заголовку корзины
   const headerRow = findCartHeaderRowByA_(sh, 'Артикул');
-  if (!headerRow) return state;
+  if (headerRow) {
+    const maxCol = Math.min(60, sh.getLastColumn());
+    const hdr = sh.getRange(headerRow, 1, 1, maxCol).getDisplayValues()[0].map(_norm_);
 
-  const maxCol = Math.min(40, sh.getLastColumn());
-  const hdr = sh.getRange(headerRow, 1, 1, maxCol).getDisplayValues()[0].map(_norm_);
-
-  for (let c = 0; c < hdr.length; c++) {
-    const t = hdr[c];
-    if (!t) continue;
-    if (t.indexOf('скидк') >= 0 && t.indexOf('%') >= 0) {
-      const col = c + 1;
-      state.col = col;
-      state.wasHidden = sh.isColumnHiddenByUser(col);
-      if (!state.wasHidden) sh.hideColumns(col);
-      return state;
+    for (let c = 0; c < hdr.length; c++) {
+      const t = hdr[c];
+      if (t && t.indexOf('скидк') >= 0 && t.indexOf('%') >= 0) {
+        candidates.push(c + 1);
+        break;
+      }
     }
   }
-  return state;
+
+  // 2. Из KP.gs
+  try {
+    if (
+      typeof KP_CFG !== 'undefined' &&
+      KP_CFG.CART_COLS &&
+      KP_CFG.CART_COLS.DISCOUNT_PCT
+    ) {
+      candidates.push(Number(KP_CFG.CART_COLS.DISCOUNT_PCT));
+    }
+  } catch (e) {}
+
+  // 3. Фолбэк — колонка M
+  candidates.push(13);
+
+  const uniq = [];
+  const seen = {};
+  for (let i = 0; i < candidates.length; i++) {
+    const col = Number(candidates[i] || 0);
+    if (!col || seen[col]) continue;
+    if (col < 1 || col > sh.getMaxColumns()) continue;
+    seen[col] = true;
+    uniq.push(col);
+  }
+
+  for (let j = 0; j < uniq.length; j++) {
+    const tryCol = uniq[j];
+
+    try {
+      state.col = tryCol;
+      state.wasHidden = sh.isColumnHiddenByUser(tryCol);
+
+      if (!state.wasHidden) {
+        sh.hideColumns(tryCol);
+        SpreadsheetApp.flush();
+        Utilities.sleep(250);
+      }
+
+      if (sh.isColumnHiddenByUser(tryCol)) {
+        return state;
+      }
+    } catch (e) {
+      // идём дальше
+    }
+  }
+
+  return { wasHidden: false, col: 0 };
 }
 
 function restoreDiscountColumnAfterPdfSafe_(sh, state) {
   if (!state || !state.col) return;
-  if (!state.wasHidden) sh.showColumns(state.col);
+  if (!state.wasHidden) {
+    try {
+      sh.showColumns(state.col);
+      SpreadsheetApp.flush();
+    } catch (e) {}
+  }
 }
 
 function findCartHeaderRowByA_(sh, anchorText) {
